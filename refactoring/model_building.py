@@ -3,7 +3,8 @@ from dl_utils import load_model_data,arcsec2rad
 import numpy as np 
 import torch.nn.functional as F
 import torch.nn as nn
-from optical_elements import DiffPupilOptic, DiffImageOptic, DiffDetector, DiffOpticalSystem
+from optical_elements import DiffPupilOptic, DiffLyotOptic, DiffImageOptic, DiffDetector, DiffOpticalSystem
+from model_classes import OPDOffsetModule
 import astropy.units as u 
 import os 
 import json
@@ -210,8 +211,16 @@ def generate_STPSF_model_params(stpsf_instrument, spec_type='A1V', catalog_spec=
     else:
         return None
 
-def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,diameter = 6.603464, DEVICE='cuda'):
+def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,diameter = 6.603464, DEVICE='cuda',
+                               oversample=2, wf_npix=1024, fpm_axial_offset=None, fpm_focal_length=None, lyot_axial_offset=None):
     """
+    Set fpm_axial_offset [m] and fpm_focal_length [m] to include an axially
+    displaced focal plane mask. Both distances refer to the equivalent optical
+    system with the telescope entrance pupil, rather than mechanical distances
+    inside NIRCam. fpm_axial_offset=None uses the nominal focal plane mask.
+    lyot_axial_offset [m] similarly displaces only the Lyot stop transmission;
+    its OPD stays at the nominal pupil plane. None uses the nominal stop.
+
     Assemble a FLIP NIRCam coron model, given some model parameters.
     Again, quite hard coded:
     - data_dir must be where the data is, and the folder structure must follow what 'generate_STPSF_model_params' generates.
@@ -221,8 +230,7 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
     """
     
     # Set up physical model for the observation being optimized on: load mask designs, known aberrations, etc.
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    wf_npix = 1024
+    DEVICE = torch.device(DEVICE)
     psf_npix = num_det_px
     psf_pixel_scale = psf_pixel_scale # arcsec/pixel, default value in LW channel
 
@@ -256,9 +264,13 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
     # 3. NIRCam Lyot: Transmission is Lyot stop, OPD is NIRCam wavelength-dependent OPD 
     # 4. NIRCam detector: Projects onto detector with MFT, and applies shifts, BFE, flat fields, etc.
 
-    JWST_primary = DiffPupilOptic(name='JWSTPrimary',opd=entrance_OPD, amplitude=aperture)
-    NIRCam_FPM = DiffImageOptic(name='NIRCam coron focal plane mask',amplitude=fpm)
-    NIRCam_Lyot = DiffPupilOptic(name='NIRCamLyotstop',opd=nircam_OPD, amplitude=lyot)
+    JWST_primary = DiffPupilOptic(name='JWSTPrimary',opd=entrance_OPD, amplitude=aperture,
+                                wfe_offsets=OPDOffsetModule(wf_npix, wf_npix, device=DEVICE))
+    NIRCam_FPM = DiffImageOptic(name='NIRCam coron focal plane mask',amplitude=fpm,
+                              axial_offset=fpm_axial_offset, focal_length=fpm_focal_length)
+    NIRCam_Lyot = DiffLyotOptic(name='NIRCamLyotstop',opd=nircam_OPD, amplitude=lyot,
+                              axial_offset=lyot_axial_offset,
+                              wfe_offsets=OPDOffsetModule(wf_npix, wf_npix, device=DEVICE))
 
     # Big TODO:
     # Now, our detector model applies a sub-pixel shift to align the center of the coronagraph in the 
@@ -288,9 +300,9 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
     elif inst_properties['image_mask'] == 'MASKLWB':
         subpix_x, subpix_y = 0.33,-0.11 # Based on F410M if I remember correctly, but should double check
 
-    NIRCam_detector = DiffDetector(prop_args,shift_x=subpix_x, shift_y=subpix_y, name='NIRCamdetector')
+    NIRCam_detector = DiffDetector(prop_args, oversample=oversample, num_det_px=num_det_px,
+                                  shift_x=subpix_x, shift_y=subpix_y, name='NIRCamdetector', device=DEVICE)
 
-    JWST_NIRCam = DiffOpticalSystem(name='JWSTNIRCamcoron',optical_element_list=[JWST_primary, NIRCam_FPM, NIRCam_Lyot, NIRCam_detector])
+    JWST_NIRCam = DiffOpticalSystem(name='JWSTNIRCamcoron',optical_element_list=[JWST_primary, NIRCam_FPM, NIRCam_Lyot, NIRCam_detector], oversample=oversample)
 
     return JWST_NIRCam
- 
