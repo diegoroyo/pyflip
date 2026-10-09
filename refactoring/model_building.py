@@ -241,7 +241,7 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
     nircam_OPD = torch.tensor(nircam_OPD, dtype=torch.float64).to(DEVICE)[None]
     lyot = torch.FloatTensor(lyot).to(DEVICE)[None]
     fpm = torch.FloatTensor(fpm).to(DEVICE)[None]
-    wlen_weights = torch.FloatTensor(wlen_weights).to(DEVICE)
+    wlen_weights = torch.as_tensor(wlen_weights, dtype=torch.float64, device=DEVICE)
 
     sampledWFEs = torch.from_numpy(sampledWFEs.copy()).float()
     sampledWFEs = F.interpolate(sampledWFEs[:, None], size=(wf_npix, wf_npix), mode='bilinear').squeeze()
