@@ -5,11 +5,11 @@ import sys
 if __package__:
     from .model_classes import OPDOffsetModule, LearnableGaussianBlur, FlatFieldingModule, DetSubPixShift, ShiftModule
     from .dl_utils import crop_to, partial_MFT, shift_image_subpixel
-    from .diffraction import FresnelTransfer
+    from .diffraction import FresnelTransfer, propagate_wavelengths
 else:
     from model_classes import OPDOffsetModule, LearnableGaussianBlur, FlatFieldingModule, DetSubPixShift, ShiftModule
     from dl_utils import crop_to, partial_MFT, shift_image_subpixel
-    from diffraction import FresnelTransfer
+    from diffraction import FresnelTransfer, propagate_wavelengths
 
 class DiffOpticalElement(nn.Module):
     def __init__(self, name=None):
@@ -125,14 +125,8 @@ class DiffLyotOptic(DiffPupilOptic):
         wavelengths = wls.to(device=phasors.device, dtype=torch.float64)
         propagators = [FresnelTransfer(d_pupil, wl) for wl in wavelengths]
 
-        def propagate(field, distance):
-            return torch.stack([
-                propagator.propagate(field[..., i, :, :], distance)
-                for i, propagator in enumerate(propagators)
-            ], dim=-3)
-
-        displaced = propagate(phasors, self.axial_offset)
-        returned = propagate(displaced * transmission, -self.axial_offset)
+        displaced = propagate_wavelengths(phasors, propagators, self.axial_offset)
+        returned = propagate_wavelengths(displaced * transmission, propagators, -self.axial_offset)
         return crop_to(returned, n_stop)
 
 
@@ -226,14 +220,8 @@ class DiffImageOptic(DiffOpticalElement):
             for wl, d_focal in zip(wavelengths, focal_sampling)
         ]
 
-        def propagate(field, distance):
-            return torch.stack([
-                propagator.propagate(field[..., i, :, :], distance)
-                for i, propagator in enumerate(propagators)
-            ], dim=-3)
-
-        displaced = propagate(phasors / phase_factor, self.axial_offset)
-        returned = propagate(displaced * self.amplitude, -self.axial_offset)
+        displaced = propagate_wavelengths(phasors / phase_factor, propagators, self.axial_offset)
+        returned = propagate_wavelengths(displaced * self.amplitude, propagators, -self.axial_offset)
         return returned * phase_factor
     
 
