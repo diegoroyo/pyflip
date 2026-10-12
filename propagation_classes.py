@@ -239,7 +239,7 @@ class PointPropagate(nn.Module):
         self.mult = nn.Parameter(torch.stack(mults), requires_grad=False)
 
     # making changes here
-    def forward(self, broadbandwavefront, wfe,wavelengths, wl_weights):
+    def forward(self, broadbandwavefront, wfe, wl_weights,wavelengths):
         output = None
         wfe_ = self.wfe_offsets(wfe)
         if self.second_wfe_offsets is not None:
