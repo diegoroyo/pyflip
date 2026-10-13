@@ -19,13 +19,18 @@ class BroadbandWavefront(nn.Module):
 
         self.coordinates = nn.Parameter(pixel_coords(self.npixels, self.diameter), requires_grad=False)
         if angles is None:
-            angles = torch.zeros(2)
-        self.angles = nn.Parameter(angles).to(DEVICE)
+            angles = torch.zeros(2).to(DEVICE)
+        else:
+            angles = angles.to(DEVICE)
+        self.angles = nn.Parameter(angles)
         if angles_offset is None:
-            angles_offset = torch.zeros(2)
-        self.angles_offset =angles_offset.to(DEVICE) # Now angles_offset is a property of the wavefront: needs to be on the DEVICE! # TODO: look into this
-        self.reset()
+            angles_offset = torch.zeros(2).to(DEVICE)
+        else:
+            angles_offset = angles_offset.to(DEVICE)
 
+        self.angles_offset =angles_offset # Now angles_offset is a property of the wavefront: needs to be on the DEVICE! # TODO: look into this
+        self.reset()
+    # TODO: some utility functions to convert from radians to arcsec and such
     def reset(self):
         if hasattr(self, 'amplitude'):
             self.amplitude.data = torch.ones_like(self.amplitude.data) / self.npixels**1

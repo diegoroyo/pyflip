@@ -6,23 +6,101 @@ from pyklip.klip import meas_contrast
 import json
 import torch.nn.functional as F
 from pyklip.fakes import gaussfit2d
+import astropy.io.fits as fits 
+import torch.nn as nn
+import copy
+import torch 
+from pyklip.klip import nan_gaussian_filter
+
+def hardcoded_match_flux(psf_model,obs_im,px_mask, wavefront, windsize=30, DEVICE='cuda'):
+    with torch.no_grad():
+        fluxwindsize = windsize
+        maskslice = px_mask[:,(int(psf_model.shape[-1]/2) - int(fluxwindsize/2)):(int(psf_model.shape[-1]/2) + int(fluxwindsize/2)),(int(psf_model.shape[-1]/2) - int(fluxwindsize/2)):(int(psf_model.shape[-1]/2) + int(fluxwindsize/2))]
+        tot_flux_pred = (maskslice*psf_model[:,(int(psf_model.shape[-1]/2) - int(fluxwindsize/2)):(int(psf_model.shape[-1]/2) + int(fluxwindsize/2)),(int(psf_model.shape[-1]/2) - int(fluxwindsize/2)):(int(psf_model.shape[-1]/2) + int(fluxwindsize/2))]).sum()
+        tot_flux_target = (maskslice*obs_im[:,(int(obs_im.shape[-1]/2) - int(fluxwindsize/2)):(int(obs_im.shape[-1]/2) + int(fluxwindsize/2)),(int(obs_im.shape[-1]/2) - int(fluxwindsize/2)):(int(obs_im.shape[-1]/2) + int(fluxwindsize/2))]).sum()
+        flux_mismatch_ratio = tot_flux_target / tot_flux_pred
+        wavefront.flux_correction.data *=flux_mismatch_ratio.to(DEVICE)
+    return wavefront
+
+def inject_fake_planets(obs,obs_noise_map, wavefront_object, optsys_object,fakes, flux_n_5_sigma, smooth_sigma_for_flux=0., pixelscale=0.062,DEVICE='cuda', **kwargs):
+    """
+    Utility function to inject fake planets to an observation.
+    obs = observation (numpy array)
+    smooth_sigma_for_flux = Smoothness used to compute the SNR, to ensure that flux_n_5_sigma of the injected planet is actually N times the 5 sigma detection after smoothing.
+    """
+    fluxes = generate_flux_rel_5sigma_fundamental_noise(fakes,obs_noise_map,flux_n_5_sigma,smooth_sigma_px=smooth_sigma_for_flux, pixelscale=pixelscale, **kwargs)
+    
+    # For simplicity, use the same optical system and such to generate the fakes; can create a new one if you want 
+    fake_planets = []
+    original_injected_peaks = []
+    with torch.no_grad(): # Don't compute gradient during these operations
+        planet_wavefront = copy.deepcopy(wavefront_object)
+        for j,planet in enumerate(fakes):
+            offset_planet = nn.Parameter(torch.FloatTensor([planet['pos_x_px'] * arcsec2rad(pixelscale), planet['pos_y_px'] * arcsec2rad(pixelscale)]))
+            offset_planet = offset_planet.to(DEVICE)
+            planet_wavefront.angles = nn.Parameter(offset_planet)
+            planet_psf = optsys_object(planet_wavefront)
+            planet_psf = planet_psf.detach().cpu().numpy() # turn to Numpy array for some operations
+            smoothed_injected = nan_gaussian_filter(np.squeeze(planet_psf), smooth_sigma_for_flux) # smooth injection with sigma=1 pixel
+            
+            normaltosmooth = np.nanmax(planet_psf) / np.nanmax(smoothed_injected)
+            # smoothed_conversiontorequiredflux = np.nanmax(smoothed_injected) * fluxes[j] # Dividing the smoothed planet by this number gives the correct flux
+            curr_pred_planet_scaled = planet_psf / np.nanmax(planet_psf) * fluxes[j] * normaltosmooth# So we divide the pre-smoothed planet by the same flux conversion factor
+            curr_pred_planet_scaled = curr_pred_planet_scaled[None] # TODO: check if I need this for the right shape
+            fake_planets.append(curr_pred_planet_scaled)
+            original_injected_peaks.append(np.nanmax(curr_pred_planet_scaled)) # save peak flux of actual injected planet
+            
+    fake_planets = np.squeeze(np.array(fake_planets)) # check if I need this for the shape
+
+    if fake_planets.ndim > 2:
+        fake_planets_all = np.nansum(fake_planets, axis=0) # If injected many planets in the same image, combine them into a single image to add to the observation
+    else:
+        fake_planets_all = fake_planets
+    
+    fake_planets_all = fake_planets_all[None]
+
+    # Inject
+    obs+=fake_planets_all
+
+    return obs, original_injected_peaks
+
+
 
 def load_and_crop_data(filepath, num_det_px=80, coron_type='335R'):
+    """
+    Utility function to load JWST data as FITS files and format them for FLIP.
+    """
+    obs = fits.open(filepath)
+    obs_image = obs[1].data
+    obs_noise = obs[2].data
+
+    coadded_image = np.mean(obs_image, axis=0)
+    coadded_image = np.squeeze(coadded_image) # I forget what the output shape is, so ensure a 2D array
+
+    coadded_noise = np.sqrt(np.sum(obs_noise**2, axis=0)) / len(obs_noise)
+    coadded_noise = np.squeeze(coadded_noise)
+
     if coron_type == '335R':
+        # Assume 320x320 SUBARRAY
         edge1y, edge2y = 160 - int(num_det_px/2), 160 + int(num_det_px/2)
         edge1x, edge2x = 160 - int(num_det_px/2), 160 + int(num_det_px/2)
         shift_y,shift_x = -14, 10
     elif coron_type == 'LWBAR':
-        edge1y, edge2y = 128 - int(80/2), 128 + int(80/2)
-        edge1x, edge2x = 200 - int(80/2), 200 + int(80/2)
+        # Assume 400x256 SUBARRAY and the NARROW fiducial point override
+        edge1y, edge2y = 128 - int(num_det_px/2), 128 + int(num_det_px/2)
+        edge1x, edge2x = 200 - int(num_det_px/2), 200 + int(num_det_px/2)
         shift_y,shift_x = -17, -64
 
     # NOW WE DO NOT HAVE AN IMAGE CENTERED AT THE ARRAY, so use known coronagraph position to crop at the right pixels
-    
-
-    real_im = np.load(f'{args.reference_file}')[args.ref_which_int, (edge1-shift_y):(edge2-shift_y), (edge1-shift_x):(edge2-shift_x)]
+    real_im = coadded_image[(edge1y-shift_y):(edge2y-shift_y), (edge1x-shift_x):(edge2x-shift_x)]
     real_im = real_im.astype(np.float32)
 
+    real_noise = coadded_noise[(edge1y-shift_y):(edge2y-shift_y), (edge1x-shift_x):(edge2x-shift_x)]
+    real_noise = real_noise.astype(np.float32)
+
+    # They are guaranteed to be 2D now, but we want 3D tensors, so add a dimension. TODO: clean up
+    
+    return real_im[None], real_noise[None]
 
 
 def shift_image_subpixel(image: torch.Tensor, shift_x: float = -0.12, shift_y: float = -0.11) -> torch.Tensor:
@@ -125,7 +203,7 @@ def weighted_smooth_l1_loss(pred, obs, noise, beta=1.0, reduction='mean'):
     else:
         return weighted_loss
 
-def load_data(data_dir, num_wl=None, oversample=None):
+def load_model_data(data_dir, num_wl=None, oversample=None):
     basic_masks_dir = os.path.join(data_dir, 'masks_1024')
 
     aperture = np.load(f'{basic_masks_dir}/primary_transmission_1024.npy')
@@ -155,6 +233,38 @@ def load_data(data_dir, num_wl=None, oversample=None):
     nircam_opd = np.array(nircam_opd)
 
     return aperture, lyot, fpm, nircam_opd, wlens_weights
+
+
+def generate_flux_rel_5sigma_fundamental_noise(fakes,noise_map,nsigma, mask_transmission_csv='/projects/b1094/rodrigoyeah/optics_jwst/flip_tentative/HIP65426/model_setup/MASK335R.csv', pixelscale=0.062, smooth_sigma_px=0.,annulus_size=4):
+    """
+    Compute what the flux of the planet should be, assuming we want it to be N times the 5 sigma fundamental noise limit at its separation.
+    """
+    
+    # In pixels relative to center of the image
+    positions = [[planet['pos_x_px'], planet['pos_y_px']] for planet in fakes]
+
+    npixels = noise_map.shape[-1]
+
+    noise_realization = np.random.normal(loc=0.0, scale=noise_map, size=noise_map.shape)
+    noise_realization = np.squeeze(noise_realization)
+    noise_curve_seps, noise_curve_fluxes = meas_contrast(noise_realization, 0, int(npixels/2), annulus_size, low_pass_filter=smooth_sigma_px)
+    instrument_throughput = np.genfromtxt(mask_transmission_csv, delimiter=',')
+
+    contrast_new_test_weighing = np.interp(noise_curve_seps * pixelscale,instrument_throughput[:,0], instrument_throughput[:,1],left=0., right=1.)
+    noise_curve_fluxes_wthroughput = noise_curve_fluxes / contrast_new_test_weighing
+
+    fluxes = []
+
+    for position in positions:
+        fivesigma_flux = np.interp(np.sqrt(position[0]**2 + position[1]**2),noise_curve_seps, noise_curve_fluxes_wthroughput)
+        #onesigma_flux = fivesigma_flux / 5. # Not quite accurate since N sigma significance is not linear with flux, 
+        # So instead, we just stipulate now that N is the factor relative to the 5 sigma fundamental noise
+        # e.g., N=1 is a 5 sigma detection, N=2 is twice the brightness of a 5 sigma detection, but not necessarily a 10 sigma detection.
+        # If we want something linear, use SNR instead (i.e., not using the small number statistics correction from Mawet 2014).
+
+        fluxes.append(fivesigma_flux*nsigma)
+    
+    return fluxes
 
 def generate_positions_sigma(N, nsigma,noise_map, npixels,scitargname=None, inj_pos=None, uniform='cartesian',data_dir='datadir'):
     # Noise map must already be "nanned" with the bad pixel map

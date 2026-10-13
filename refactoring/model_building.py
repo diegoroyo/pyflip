@@ -1,5 +1,5 @@
 import torch
-from dl_utils import load_data,arcsec2rad
+from dl_utils import load_model_data,arcsec2rad
 import numpy as np 
 import torch.nn.functional as F
 import torch.nn as nn
@@ -12,9 +12,9 @@ def assemble_JWST_NIRCam_coron(data_dir, num_wl, oversample,num_det_px,psf_pixel
     psf_pixel_scale = psf_pixel_scale # arcsec/pixel, default value in LW channel
 
     if oversample is None and num_wl is None:
-        aperture, lyot, fpm, nircam_OPD, wlen_weights = load_data(data_dir=data_dir)
+        aperture, lyot, fpm, nircam_OPD, wlen_weights = load_model_data(data_dir=data_dir)
     else:
-        aperture, lyot, fpm, nircam_OPD, wlen_weights = load_data(data_dir=data_dir, num_wl=num_wl, oversample=oversample)
+        aperture, lyot, fpm, nircam_OPD, wlen_weights = load_model_data(data_dir=data_dir, num_wl=num_wl, oversample=oversample)
         
     aperture = torch.FloatTensor(aperture.copy()).to(DEVICE)[None]
 
@@ -46,12 +46,12 @@ def assemble_JWST_NIRCam_coron(data_dir, num_wl, oversample,num_det_px,psf_pixel
     # 3. NIRCam Lyot: Transmission is Lyot stop, OPD is NIRCam wavelength-dependent OPD 
     # 4. NIRCam detector: Projects onto detector with MFT, and applies shifts, BFE, flat fields, etc.
 
-    JWST_primary = DiffPupilOptic(name='JWST Primary',opd=entrance_OPD, amplitude=aperture)
+    JWST_primary = DiffPupilOptic(name='JWSTPrimary',opd=entrance_OPD, amplitude=aperture)
     NIRCam_FPM = DiffImageOptic(name='NIRCam coron focal plane mask',amplitude=fpm)
-    NIRCam_Lyot = DiffPupilOptic(name='NIRCam Lyot stop',opd=nircam_OPD, amplitude=lyot)
-    NIRCam_detector = DiffDetector(prop_args,name='NIRCam detector')
+    NIRCam_Lyot = DiffPupilOptic(name='NIRCamLyotstop',opd=nircam_OPD, amplitude=lyot)
+    NIRCam_detector = DiffDetector(prop_args,name='NIRCamdetector')
 
-    JWST_NIRCam = DiffOpticalSystem(name='JWST NIRCam coron',optical_element_list=[JWST_primary, NIRCam_FPM, NIRCam_Lyot, NIRCam_detector])
+    JWST_NIRCam = DiffOpticalSystem(name='JWSTNIRCamcoron',optical_element_list=[JWST_primary, NIRCam_FPM, NIRCam_Lyot, NIRCam_detector])
 
     return JWST_NIRCam
  

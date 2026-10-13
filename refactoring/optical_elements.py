@@ -3,6 +3,7 @@ import torch
 import numpy as np 
 from model_classes import OPDOffsetModule, LearnableGaussianBlur,FlatFieldingModule, DetSubPixShift
 from dl_utils import crop_to, partial_MFT, shift_image_subpixel
+import sys 
 
 class DiffOpticalElement(nn.Module):
     def __init__(self, name=None):
@@ -145,7 +146,21 @@ class DiffOpticalSystem(nn.Module):
     def __init__(self, name=None, optical_element_list = None, oversample = 2):
         super().__init__()
         self.name = name 
-        self.optical_system = nn.ModuleList(optical_element_list) # Assumes first optic is a pupil plane and last is a detector; TODO: make more flexible later
+        # We want parameters to be in a dictionary that preserves key order
+        if sys.version_info >= (3, 7):
+            # Can use normal dictionary as it preserves key order
+            element_dict = {}
+            for element in optical_element_list:
+                element_dict[element.name.replace(" ", "")] = element
+        else:
+            # have to use an OrderedDict
+            from collections import OrderedDict
+            element_dict = OrderedDict([(element.name.replace(" ", ""),element) for element in optical_element_list])
+            print("Older than Python 3.7")
+            
+
+        #self.optical_system = nn.ModuleList(optical_element_list) # Assumes first optic is a pupil plane and last is a detector; TODO: make more flexible later
+        self.optical_system = nn.ModuleDict(element_dict)
         self.oversample = oversample # Can in principle be different from the detector oversampling
 
     @property
@@ -155,7 +170,8 @@ class DiffOpticalSystem(nn.Module):
     def forward(self, broadbandwavefront):
         phasor = broadbandwavefront.get_phasors()
         normalize=True
-        for element in self.optical_system:
+        for key in self.optical_system.keys():
+            element = self.optical_system[key]
             if element.optic_type == 'pupil':
                 phasor = element(phasor, broadbandwavefront.wavelengths, normalize=normalize)
                 normalize = False # Only normalize at the telescope aperture, first pupil optic
