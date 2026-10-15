@@ -203,39 +203,35 @@ def weighted_smooth_l1_loss(pred, obs, noise, beta=1.0, reduction='mean'):
     else:
         return weighted_loss
 
-def load_model_data(data_dir, num_wl=None, oversample=None):
-    basic_masks_dir = os.path.join(data_dir, 'masks_1024')
+def load_model_data(data_dir):
+    basic_masks_dir = os.path.join(data_dir, 'pupil_masks')
 
-    aperture = np.load(f'{basic_masks_dir}/primary_transmission_1024.npy')
+    aperture = np.load(f'{basic_masks_dir}/primary_transmission.npy')
     aperture = np.flip(aperture, axis=0)
-    lyot = np.load(f'{basic_masks_dir}/circlyotstop_transmission_1024.npy')
-    if num_wl is not None or oversample is not None:
-        data_dir = os.path.join(data_dir, f'npix_{int(1024*oversample)}_num_wl_{int(num_wl)}')
-    # else:
-        
-        # basic_masks_dir = os.path.join(data_dir, f'mask_{int(1024*oversample)}')
 
-        # aperture = np.load(f'{basic_masks_dir}/primary_transmission_1024.npy')
-        # aperture = np.flip(aperture, axis=0)
-        # lyot = np.load(f'{basic_masks_dir}/circlyotstop_transmission_1024.npy')
+    sampledWFEs = np.load(f'{data_dir}/opds/observation_opd.npy')
+    sampledWFEs = np.flip(sampledWFEs, axis=0)[None]
+
+    lyot = np.load(f'{basic_masks_dir}/lyotstop_transmission.npy')
 
     # WAVELENGTH DEPENDENCE
+    data_dir_wldep = os.path.join(data_dir, f'wavelength_dependents')
 
-    wlens_weights = np.load(os.path.join(data_dir, 'wlens_weights', 'lambda_weights.npy'))
+    wlens_weights = np.load(os.path.join(data_dir_wldep, 'wlens_weights', 'lambda_weights.npy'))
     fpm, nircam_opd = [], []
     for i in range(len(wlens_weights[0])):
-        currfpm = np.load(f'{data_dir}/mask335r_transmissions/mask335r_transmission_{i}.npy')
-        curr_nircamopd = np.load(f'{data_dir}/fov_wl_nircam_opds/fov_wl_nircam_opd_{i}.npy')
+        currfpm = np.load(f'{data_dir_wldep}/image_mask_transmissions/image_mask_transmission_{i}.npy')
+        curr_nircamopd = np.load(f'{data_dir_wldep}/fov_wl_nircam_opds/fov_wl_nircam_opd_{i}.npy')
         fpm.append(currfpm)
         nircam_opd.append(curr_nircamopd)
 
     fpm = np.array(fpm)
     nircam_opd = np.array(nircam_opd)
 
-    return aperture, lyot, fpm, nircam_opd, wlens_weights
+    return aperture, lyot, fpm, nircam_opd, wlens_weights, sampledWFEs
 
 
-def generate_flux_rel_5sigma_fundamental_noise(fakes,noise_map,nsigma, mask_transmission_csv='/projects/b1094/rodrigoyeah/optics_jwst/flip_tentative/HIP65426/model_setup/MASK335R.csv', pixelscale=0.062, smooth_sigma_px=0.,annulus_size=4):
+def generate_flux_rel_5sigma_fundamental_noise(fakes,noise_map,nsigma, mask_name='MASK335R', pixelscale=0.062, smooth_sigma_px=0.,annulus_size=4):
     """
     Compute what the flux of the planet should be, assuming we want it to be N times the 5 sigma fundamental noise limit at its separation.
     """
@@ -248,8 +244,19 @@ def generate_flux_rel_5sigma_fundamental_noise(fakes,noise_map,nsigma, mask_tran
     noise_realization = np.random.normal(loc=0.0, scale=noise_map, size=noise_map.shape)
     noise_realization = np.squeeze(noise_realization)
     noise_curve_seps, noise_curve_fluxes = meas_contrast(noise_realization, 0, int(npixels/2), annulus_size, low_pass_filter=smooth_sigma_px)
-    instrument_throughput = np.genfromtxt(mask_transmission_csv, delimiter=',')
+    if mask_name is not None:
+        mask_transmission_csv = f'data/coron_transmission_csvs/{mask_name}.csv'
+        try:
+            instrument_throughput = np.genfromtxt(mask_transmission_csv, delimiter=',')
+        except FileNotFoundError:
+            raise FileNotFoundError('Valid mask names are MASK210R, MASK335R, MASK430R, MASKLWB_F250M, MASKLWB_F480M, MASKLWB_NARROW, MASKLWB_F182M, MASKLWB_F212N')
+    else:
+        # assume no mask is used, so uniform throughput = 1
+        seps = np.linspace(0,5,100)
+        thr = np.ones_like(seps)
+        instrument_throughput = np.vstack([seps,thr]).T
 
+    # noise_curve_seps is always non-negative
     contrast_new_test_weighing = np.interp(noise_curve_seps * pixelscale,instrument_throughput[:,0], instrument_throughput[:,1],left=0., right=1.)
     noise_curve_fluxes_wthroughput = noise_curve_fluxes / contrast_new_test_weighing
 
@@ -266,7 +273,7 @@ def generate_flux_rel_5sigma_fundamental_noise(fakes,noise_map,nsigma, mask_tran
     
     return fluxes
 
-def generate_positions_sigma(N, nsigma,noise_map, npixels,scitargname=None, inj_pos=None, uniform='cartesian',data_dir='datadir'):
+def generate_positions_sigma(N, nsigma,noise_map, npixels, inj_pos=None, uniform='cartesian',data_dir='datadir'):
     # Noise map must already be "nanned" with the bad pixel map
     # First generate the N samples
     samples = []
@@ -657,14 +664,6 @@ def circular_mask(im, peak_x,peak_y, rad_to_mask, value_to_mask, mask_inside=Tru
         circlito = np.where(((mesh[0] - peak_x)**2 + (mesh[1]-peak_y)**2 > rad_to_mask**2), value_to_mask, im)
     return circlito
 
-# def get_peak_in_circle(im, offset_x,offset_y, rad):
-#     origin_x, origin_y = im.shape[0]/2, im.shape[1]/2
-#     offset_x_pix, offset_y_pix = offset_x/0.063, offset_y/0.063
-#     peakpix_x, peakpix_y = origin_x + offset_x_pix, origin_y+offset_y_pix
-#     xcoords = np.arange(im.shape[-1])
-#     mesh = np.meshgrid(xcoords,xcoords)
-#     circlito = np.where(((mesh[0] - peakpix_x)**2 + (mesh[1]-peakpix_y)**2 < rad**2), im, np.nan)
-#     return circlito
 
 def calc_snr(im, offset_x,offset_y, rad_blob, rad_ann, width=0.2, blur_before_signal=False, blur_annulus=True, sigma_kernel=0.0,return_signal_peak=False):
     psf_pixel_scale = 0.062424185
