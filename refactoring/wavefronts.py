@@ -28,7 +28,7 @@ class BroadbandWavefront(nn.Module):
         else:
             angles_offset = angles_offset.to(DEVICE)
 
-        self.angles_offset =angles_offset # Now angles_offset is a property of the wavefront: needs to be on the DEVICE! # TODO: look into this
+        self.angles_offset =nn.Parameter(angles_offset) # Now angles_offset is a property of the wavefront: needs to be on the DEVICE! # TODO: look into this
         self.reset()
     # TODO: some utility functions to convert from radians to arcsec and such
     def reset(self):

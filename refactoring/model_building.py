@@ -6,6 +6,7 @@ import torch.nn as nn
 from optical_elements import DiffPupilOptic, DiffImageOptic, DiffDetector, DiffOpticalSystem
 import astropy.units as u 
 import os 
+import json
 
 # Important: before importing STPSF and POPPY and using the functions in this module, 
 # at least two environment variables below must be set to wherever 
@@ -184,6 +185,25 @@ def generate_STPSF_model_params(stpsf_instrument, spec_type='A1V', catalog_spec=
         np.save(masks_filenames[i],masks_transmissions[i])
         np.save(nircamopds_filenames[i],nircamopds[i])
 
+    # Log information
+    prop_dict = {}
+
+    prop_dict['instrument'] = stpsf_instrument.name
+    prop_dict['filter'] = stpsf_instrument.filter
+    prop_dict['image_mask'] = stpsf_instrument.image_mask
+    prop_dict['pupil_mask'] = stpsf_instrument.pupil_mask
+    prop_dict['pupil_shift_x'] = stpsf_instrument.options['pupil_shift_x']
+    prop_dict['pupil_shift_y'] = stpsf_instrument.options['pupil_shift_y']
+    prop_dict['pupil_rotation'] = stpsf_instrument.options['pupil_rotation']
+    prop_dict['img_oversample'] = oversample
+    prop_dict['num_wl'] = num_wl 
+
+    if 'bar_offset' in stpsf_instrument.options.keys():
+        prop_dict['bar_offset'] = stpsf_instrument.options['bar_offset'] 
+
+    with open(os.path.join(folder_to_save, 'instrument_config.json'), "w") as f:
+        json.dump(prop_dict, f, indent=4)
+
     if return_data:
         return wlen_wlen_we_arr, opd_observation,masks_transmissions,nircamopds, optsys,psf_nircam_instance
     else:
@@ -195,8 +215,6 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
     Again, quite hard coded:
     - data_dir must be where the data is, and the folder structure must follow what 'generate_STPSF_model_params' generates.
         This argument must be the same as folder_to_save in the function above. 
-    - num_wl, oversample: number of wavelengths and oversampling factor used in 'generate_STPSF_model_params'.
-        TODO: Only really needed to parse the folder name, so could remove later.
     - psf_pixel_scale: Must match the STPSF model: 0.062424185 if channel == 'long'; half of that if 'short'.
         TODO: Clean this up to get pixel scale automtically from STPSF insturment, maybe with a wrapper 
     """
@@ -240,7 +258,36 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
     JWST_primary = DiffPupilOptic(name='JWSTPrimary',opd=entrance_OPD, amplitude=aperture)
     NIRCam_FPM = DiffImageOptic(name='NIRCam coron focal plane mask',amplitude=fpm)
     NIRCam_Lyot = DiffPupilOptic(name='NIRCamLyotstop',opd=nircam_OPD, amplitude=lyot)
-    NIRCam_detector = DiffDetector(prop_args,name='NIRCamdetector')
+
+    # Big TODO:
+    # Now, our detector model applies a sub-pixel shift to align the center of the coronagraph in the 
+    # PSF model with the center of the coronagraph in the image data. The integer pixel shift is already
+    # "applied" by the dl_utils.load_and_crop_data function, which crops the data so that the center of
+    # the coronagraph is as close as possible to the center of the Npix x Npix array, up to an integer number
+    # of pixels. We don't want to interpolate our data to avoid artifacts, so the last "sub-pixel" shifting/interpolation
+    # must be done in our model.
+
+    # This sub-pixel shift is coronagraph and filter dependent; so we read-in the instrument configuration file 
+    # to know what instrument/filter we are using, and perform the corresponding sub-pixel shift, hoping that the
+    # integer-pixel shift (cropping the data) was done correctly.
+
+    # Right now this is hardcoded and only for a couple of filters, so ideally in the future we make both this routine and the cropping-the-data
+    # routine more flexible e.g. with Jarron's shifts. We should also test this more rigorously at some point,
+    # since now it is ignoring e.g. the filter differences in the MASKLWB_NARROW configuration.
+
+    # It is not terribly important for detection, but we definitely will need to refine this for accurate astrometry.
+
+    with open(os.path.join(data_dir, 'instrument_config.json'), "r") as f:
+        inst_properties = json.load(f)
+
+    subpix_x, subpix_y =  0.,0.
+
+    if inst_properties['image_mask'] == 'MASK335R' and inst_properties['filter'] == 'F444W':
+        subpix_x, subpix_y = -0.12,-0.11
+    elif inst_properties['image_mask'] == 'MASKLWB':
+        subpix_x, subpix_y = 0.33,-0.11 # Based on F410M if I remember correctly, but should double check
+
+    NIRCam_detector = DiffDetector(prop_args,shift_x=subpix_x, shift_y=subpix_y, name='NIRCamdetector')
 
     JWST_NIRCam = DiffOpticalSystem(name='JWSTNIRCamcoron',optical_element_list=[JWST_primary, NIRCam_FPM, NIRCam_Lyot, NIRCam_detector])
 

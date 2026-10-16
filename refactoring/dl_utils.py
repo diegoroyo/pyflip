@@ -10,7 +10,87 @@ import astropy.io.fits as fits
 import torch.nn as nn
 import copy
 import torch 
+import matplotlib.pyplot as plt 
 from pyklip.klip import nan_gaussian_filter
+
+
+def track_SNR(est_residual_obs, curr_iter, track_locs, track_fluxes,app_size=0.3, mask_name=None, vis_dir_iterations='vis_iters', snr_smooth_sigma=0.,psf_pixel_scale_arcsec=0.062, px_mask_numpy=None, save_plot=True):
+    # Now, track the signal loss and SNR of injected planets (and real planets, if applicable)
+    
+    # Exclude bad pixels from SNR calculation
+    if px_mask_numpy is not None:
+        px_mask_nanned = np.where(px_mask_numpy == 0., np.nan, px_mask_numpy)
+    else:
+        px_mask_nanned = 1.
+
+    # For convenience, if we have a MASKLWB, we also have to omit the region along the bar from the SNR
+    if 'MASKLWB' in mask_name:
+        if px_mask_nanned.shape[-1] == 80:
+            # We only have a pre-generated pixel map for the 80x80 case
+            mask_along_bar = f'data/common_masks/mask_along_bar.npy'
+            mask_along_bar = np.load(mask_along_bar)
+            mask_along_bar_nanned = np.where(mask_along_bar == 0., np.nan, mask_along_bar)
+            px_mask_nanned+=mask_along_bar_nanned # Combine into a single NAN mask
+
+        else:
+            print('We should exclude the region along the bar from SNR calculation, but only 80x80 mask is implemented for now')
+            print('Omitting')
+
+    residual = est_residual_obs
+
+    masked_residual = residual * px_mask_nanned
+    
+    curr_iter_snrs, curr_iter_signal_blob_peak = [], []
+    #Check SNRs of known synthetic planets that were injected
+    for j, loc in enumerate(track_locs):
+        # Every element in track_locs must have this structure: fakes = [{'pos_x_px':10., 'pos_y_px': 0.}]
+        xpos, ypos = loc['pos_x_px']*psf_pixel_scale_arcsec, loc['pos_y_px']*psf_pixel_scale_arcsec
+
+        # Extract peak of injection without smoothing, for a good tracker of signal loss
+        _, annulus, signal_blob, peak_blob = calc_snr(masked_residual[0], xpos, ypos,app_size,np.sqrt(xpos**2 + ypos**2),return_signal_peak=True)
+
+        # Smooth (optionally) when computing actual SNR
+        curr_snr, _, _ = calc_snr(masked_residual[0], xpos, ypos,app_size,np.sqrt(xpos**2 + ypos**2), sigma_kernel=snr_smooth_sigma)
+
+        curr_iter_snrs.append(curr_snr)
+        curr_iter_signal_blob_peak.append(peak_blob)
+        if save_plot:
+            # Create folder to save everything in
+            if not os.path.isdir(vis_dir_iterations):
+                os.makedirs(vis_dir_iterations, exist_ok=True)
+
+            # Create sub-folder for current iteration saves
+            vis_dir_iterations_current = os.path.join(vis_dir_iterations, 'iter'+str(curr_iter))
+            if not os.path.isdir(vis_dir_iterations_current):
+                os.makedirs(vis_dir_iterations_current, exist_ok=True)
+                
+            plt.figure(figsize=[15,10])
+            plt.subplot(231)
+            plt.imshow(residual[0], origin='lower')
+            plt.title(f'Sum, peak = {np.nansum(residual[0]):.2f},{np.nanmax(residual[0]):.2f} (orig)')
+            plt.subplot(232)
+            plt.imshow(masked_residual[0], origin='lower', vmin=-10)
+            plt.subplot(234)
+            plt.imshow(annulus, origin='lower')
+            plt.title(f'Stddev = {np.nanstd(annulus):.2f} (annulus synthetic)')
+            plt.subplot(235)
+            plt.imshow(signal_blob, origin='lower')
+            plt.title(f'Sum, peak = {np.nansum(signal_blob):.2f},{peak_blob:.2f},\n pos x, pos y, flux input ={loc["pos_x_px"]:.2f},{loc["pos_y_px"]:.2f},{track_fluxes[j]:.2f}')
+            whole_annulus = np.where(~np.isnan(signal_blob), signal_blob, annulus)
+            plt.subplot(236)
+            plt.imshow(whole_annulus, origin='lower')
+            plt.title(f'Whole annulus. \n Peak, mean, stddev = {np.nanmax(whole_annulus):.2f}, {np.nanmean(whole_annulus):.2f}, {np.nanstd(whole_annulus):.2f}')
+            plt.suptitle(f'Curr SNR: {curr_snr:.2f}')
+            plt.tight_layout()
+            plt.savefig(f'{vis_dir_iterations_current}/vis_measurement_INJECTED_iter{curr_iter}_comp{j}.png')
+            plt.close()
+
+    curr_iter_snrs = np.array(curr_iter_snrs) # Array with current SNRs of all sources tracked
+    curr_iter_signal_blob_peak = np.array(curr_iter_signal_blob_peak) # Array with current peak of all sources tracked
+    signal_losses = curr_iter_signal_blob_peak/track_fluxes # Array with current signal loss, relative to initial flux
+
+    return curr_iter_signal_blob_peak, signal_losses, curr_iter_snrs
+
 
 def hardcoded_match_flux(psf_model,obs_im,px_mask, wavefront, windsize=30, DEVICE='cuda'):
     with torch.no_grad():
@@ -28,6 +108,9 @@ def inject_fake_planets(obs,obs_noise_map, wavefront_object, optsys_object,fakes
     obs = observation (numpy array)
     smooth_sigma_for_flux = Smoothness used to compute the SNR, to ensure that flux_n_5_sigma of the injected planet is actually N times the 5 sigma detection after smoothing.
     """
+
+    # TODO: Get rid of pixelscale keyword and just extract it from something else (e.g. our optsys_object)
+
     fluxes = generate_flux_rel_5sigma_fundamental_noise(fakes,obs_noise_map,flux_n_5_sigma,smooth_sigma_px=smooth_sigma_for_flux, pixelscale=pixelscale, **kwargs)
     
     # For simplicity, use the same optical system and such to generate the fakes; can create a new one if you want 
@@ -66,9 +149,11 @@ def inject_fake_planets(obs,obs_noise_map, wavefront_object, optsys_object,fakes
 
 
 
-def load_and_crop_data(filepath, num_det_px=80, coron_type='335R'):
+def load_and_crop_data(filepath, num_det_px=80, coron_type='MASK335R', crop_params=None):
     """
     Utility function to load JWST data as FITS files and format them for FLIP.
+
+    Current automatic options are 'MASK335R' and 'MASKLWB_NARROW'.
     """
     obs = fits.open(filepath)
     obs_image = obs[1].data
@@ -80,16 +165,24 @@ def load_and_crop_data(filepath, num_det_px=80, coron_type='335R'):
     coadded_noise = np.sqrt(np.sum(obs_noise**2, axis=0)) / len(obs_noise)
     coadded_noise = np.squeeze(coadded_noise)
 
-    if coron_type == '335R':
+    if coron_type == 'MASK335R':
         # Assume 320x320 SUBARRAY
         edge1y, edge2y = 160 - int(num_det_px/2), 160 + int(num_det_px/2)
         edge1x, edge2x = 160 - int(num_det_px/2), 160 + int(num_det_px/2)
         shift_y,shift_x = -14, 10
-    elif coron_type == 'LWBAR':
+    elif coron_type == 'MASKLWBAR_NARROW':
         # Assume 400x256 SUBARRAY and the NARROW fiducial point override
         edge1y, edge2y = 128 - int(num_det_px/2), 128 + int(num_det_px/2)
         edge1x, edge2x = 200 - int(num_det_px/2), 200 + int(num_det_px/2)
         shift_y,shift_x = -17, -64
+    elif crop_params is not None:
+        # Apply custom crop to the field of view; must be of the form (example for MASKLWB_NARROW):
+        # crop_params = {'hsize':400, 'vsize':256, 'shift_y': -17, 'shift_x': -64}
+        edge1y, edge2y = int(crop_params['vsize']/2) - int(num_det_px/2), int(crop_params['vsize']/2) + int(num_det_px/2)
+        edge1x, edge2x = int(crop_params['hsize']/2) - int(num_det_px/2), int(crop_params['hsize']/2) + int(num_det_px/2)
+        shift_y,shift_x = crop_params['shift_y'], crop_params['shift_y']
+    else:
+        raise ValueError('You must specify how to crop the observation')
 
     # NOW WE DO NOT HAVE AN IMAGE CENTERED AT THE ARRAY, so use known coronagraph position to crop at the right pixels
     real_im = coadded_image[(edge1y-shift_y):(edge2y-shift_y), (edge1x-shift_x):(edge2x-shift_x)]

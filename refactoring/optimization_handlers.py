@@ -7,35 +7,35 @@ def default_stages(instrument, wavefront, stage_number, stage_cutoffs = [600, 35
     # Technically we don't need to multiply by 1, but keep for now for clarity and see if it slows down the code too much
     if stage_number < stage_cutoffs[0]:
         # Only fit star position
-        wavefront.angles.grad*=1.
+        wavefront.angles_offset.grad*=1.
         instrument.optical_system.JWSTPrimary.wfe_offsets.grid.grad*= 0.
         instrument.optical_system.NIRCamLyotstop.wfe_offsets.grid.grad*= 0.
         instrument.optical_system.NIRCamdetector.detector_flat_field.grid.grad*= 0.
     
     elif stage_number > stage_cutoffs[0] and stage_number < stage_cutoffs[1]:
         # Stop fitting position and flux; only fit OPDs
-        wavefront.angles.grad*=0.
+        wavefront.angles_offset.grad*=0.
         instrument.optical_system.JWSTPrimary.wfe_offsets.grid.grad*= 1.
         instrument.optical_system.NIRCamLyotstop.wfe_offsets.grid.grad*= 1.
         instrument.optical_system.NIRCamdetector.detector_flat_field.grid.grad*= 0.
 
     elif stage_number > stage_cutoffs[1] and stage_number < stage_cutoffs[2]:
         # Fit OPDs and detector flats
-        wavefront.angles.grad*=0
+        wavefront.angles_offset.grad*=0
         instrument.optical_system.JWSTPrimary.wfe_offsets.grid.grad*= 1.
         instrument.optical_system.NIRCamLyotstop.wfe_offsets.grid.grad*= 1.
         instrument.optical_system.NIRCamdetector.detector_flat_field.grid.grad*= 1.
     
     elif stage_number > stage_cutoffs[2] and stage_number < stage_cutoffs[3]:
         # Now we should be on the science star, so again only fit star position
-        wavefront.angles.grad*=1.
+        wavefront.angles_offset.grad*=1.
         instrument.optical_system.JWSTPrimary.wfe_offsets.grid.grad*= 0.
         instrument.optical_system.NIRCamLyotstop.wfe_offsets.grid.grad*= 0.
         instrument.optical_system.NIRCamdetector.detector_flat_field.grid.grad*= 0.
 
     elif stage_number > stage_cutoffs[3]:
         # Fitting only one OPD in science star, and stop fitting position
-        wavefront.angles.grad*=0.
+        wavefront.angles_offset.grad*=0.
         instrument.optical_system.JWSTPrimary.wfe_offsets.grid.grad*= 0.
         instrument.optical_system.NIRCamLyotstop.wfe_offsets.grid.grad*= 1.
         instrument.optical_system.NIRCamdetector.detector_flat_field.grid.grad*= 0.    
