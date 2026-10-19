@@ -3,51 +3,46 @@ from model_building import assemble_JWST_NIRCam_coron
 from optimization_handlers import default_stages
 import torch.nn as nn
 import torch 
-from dl_utils import load_model_data, load_and_crop_data, inject_fake_planets, hardcoded_match_flux
+from dl_utils import load_model_data, load_and_crop_data, inject_fake_planets, hardcoded_match_flux,track_SNR
 import numpy as np
 import tqdm
 import torch.nn.functional as F
 
 ### TODO:
-#- Generate model parameters using STPSF
-#- Inject fake planets
 #- Track SNR
+#- save calibrated model for future reference
 #- Visualization tools
-#- Coronagraph mask profiles
-#- flux fitting
+# Test on other data
 
 #### MODEL GENERATION
 
-# Create a wavefront 
-contrast_normalization = 0.003716380479003919
-sim_to_real_scaling = 2.1722325193439986 # from comparing the simulation with the peak brightness of the real data
-photons_normalization = 90578.00102527262 * sim_to_real_scaling *1e4 / 2251.24456327477 # mJy/sr
-peak_flux_star  = nn.Parameter(torch.FloatTensor([photons_normalization / contrast_normalization]))
+
+peak_flux_star  = nn.Parameter(torch.FloatTensor([1.]))
 
 wf_npix = 1024
 diameter = 6.603464
 DEVICE = 'cuda'
 num_wl = 21
 oversample = 2
-data_dir = '/projects/b1094/rodrigoyeah/optics_jwst/flip_tentative/HIP65426/model_setup'
+data_dir = '/projects/b1094/rodrigoyeah/optics_jwst/flip_tentative/refactoring/uuu'
 num_det_px = 80
 
 # Stellar position
 offset_STAR = nn.Parameter(torch.FloatTensor([0., 0.])).to(DEVICE)
 
 # TODO: wrapper function to do all of this at once for the simpler cases, including using STPSF to generate the masks and such
-_, _, _, _, wlen_weights = load_model_data(data_dir=data_dir, num_wl=num_wl, oversample=oversample)
+_, _, _, _, wlen_weights, _ = load_model_data(data_dir=data_dir)
 
 # Set up the wavefront object: this will be propagated by our optical model
 wavefront_broad = BroadbandWavefront(wf_npix, diameter, wlen_weights, peak_flux_star, offset_STAR).to(DEVICE)
 
-diffnircam = assemble_JWST_NIRCam_coron(data_dir, num_wl, oversample,num_det_px)
+diffnircam = assemble_JWST_NIRCam_coron(data_dir,num_det_px)
 
 result = diffnircam(wavefront_broad)
 
 result = result.detach().cpu().numpy()
 
-np.save('/projects/b1094/rodrigoyeah/optics_jwst/flip_tentative/refactoring/res.npy', result)
+np.save('/projects/b1094/rodrigoyeah/optics_jwst/flip_tentative/refactoring/res2.npy', result)
 
 
 #### OPTIMIZER SETUP
@@ -93,8 +88,8 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=schedule
 ######### LOAD RELEVANT DATA
 refdatapath = '/projects/b1094/rodrigoyeah/optics_jwst/EDDO_repo/EDDO/HIP65426_newmodel/NEWGOODDATA/onlycalints_nanreplaced/jw01386001001_0310e_00001_nrcalong_calints.fits'
 scidatapath = '/projects/b1094/rodrigoyeah/optics_jwst/EDDO_repo/EDDO/HIP65426_newmodel/NEWGOODDATA/onlycalints_nanreplaced/jw01386002001_0310a_00001_nrcalong_calints.fits'
-ref, ref_noise = load_and_crop_data(refdatapath, num_det_px=80, coron_type='335R')
-sci, sci_noise = load_and_crop_data(scidatapath, num_det_px=80, coron_type='335R')
+ref, ref_noise = load_and_crop_data(refdatapath, num_det_px=80, coron_type='MASK335R')
+sci, sci_noise = load_and_crop_data(scidatapath, num_det_px=80, coron_type='MASK335R')
 
 # Array with 0s and 1s, used to mask certain pixels (e.g., dead or hot pixels) from contributing to the loss function
 # Has to be provided by the user, probably after a first pass. Will depend on the pixel cleaning routine used.
@@ -125,6 +120,9 @@ stage_cutoffs = [600, 3500, 5500, 6100, 11000] # Iterations separating stage 1.1
 
 
 tbar = tqdm.tqdm(range(scheduler_iters + 1), mininterval=30.0)
+
+# Track injected planets
+signal_peaks_arr, signal_losses_arr, snrs_arr, track_iters = [], [], [], []
 
 for i in tbar:
 
@@ -175,6 +173,17 @@ for i in tbar:
 
 
     # Now, track SNR of injected planet(s)
-    # if i%measure_SNR_every == 0 and i > stage_cutoffs[2]: # only measure in science target
-    #     track_SNR(sci, PSF,)
-    #     pass
+    if i%measure_SNR_every == 0 and i > stage_cutoffs[2]: # only measure in science target
+        residual_sci = sci - PSF 
+        residual_sci = residual_sci.detach().cpu().numpy()
+        signal_peaks, signal_losses, snrs = track_SNR(residual_sci, i, fakes, injected_fluxes,mask_name='MASK335R', snr_smooth_sigma=1., px_mask_numpy=px_mask_numpy)
+        signal_peaks_arr.append(signal_peaks)
+        signal_losses_arr.append(signal_losses)
+        snrs_arr.append(snrs)
+        track_iters.append(i)
+
+# After everything, save these diagnostics and such 
+signal_peaks_arr = np.array(signal_peaks_arr)
+signal_losses_arr = np.array(signal_losses_arr)
+snrs_arr = np.array(snrs_arr)
+track_iters = np.array(track_iters)
