@@ -291,16 +291,17 @@ class DiffOpticalSystem(nn.Module):
     def __init__(self, name=None, optical_element_list = None, oversample = 2):
         super().__init__()
         self.name = name 
-        # We want parameters to be in a dictionary that preserves key order
+        # We want parameters to be in a dictionary that preserves key order.
+        # Unnamed elements are keyed by class name and position.
+        keys = [(getattr(element, 'name', None) or f'{type(element).__name__}{i}').replace(" ", "")
+                for i, element in enumerate(optical_element_list)]
         if sys.version_info >= (3, 7):
             # Can use normal dictionary as it preserves key order
-            element_dict = {}
-            for element in optical_element_list:
-                element_dict[element.name.replace(" ", "")] = element
+            element_dict = dict(zip(keys, optical_element_list))
         else:
             # have to use an OrderedDict
             from collections import OrderedDict
-            element_dict = OrderedDict([(element.name.replace(" ", ""),element) for element in optical_element_list])
+            element_dict = OrderedDict(zip(keys, optical_element_list))
             print("Older than Python 3.7")
             
 
