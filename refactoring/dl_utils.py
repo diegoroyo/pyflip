@@ -180,7 +180,7 @@ def load_and_crop_data(filepath, num_det_px=80, coron_type='MASK335R', crop_para
         # crop_params = {'hsize':400, 'vsize':256, 'shift_y': -17, 'shift_x': -64}
         edge1y, edge2y = int(crop_params['vsize']/2) - int(num_det_px/2), int(crop_params['vsize']/2) + int(num_det_px/2)
         edge1x, edge2x = int(crop_params['hsize']/2) - int(num_det_px/2), int(crop_params['hsize']/2) + int(num_det_px/2)
-        shift_y,shift_x = crop_params['shift_y'], crop_params['shift_y']
+        shift_y,shift_x = crop_params['shift_y'], crop_params['shift_x']
     else:
         raise ValueError('You must specify how to crop the observation')
 

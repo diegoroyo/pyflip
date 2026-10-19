@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch
 import numpy as np 
-from model_classes import OPDOffsetModule, LearnableGaussianBlur,FlatFieldingModule, DetSubPixShift
+from model_classes import OPDOffsetModule, LearnableGaussianBlur,FlatFieldingModule, DetSubPixShift,ShiftModule
 from dl_utils import crop_to, partial_MFT, shift_image_subpixel
 import sys 
 
@@ -29,6 +29,8 @@ class DiffPupilOptic(DiffOpticalElement):
         else:
             self.wfe_offsets = wfe_offsets
 
+        self.pupil_shifts = ShiftModule(amplitude.shape[-2], amplitude.shape[-1])
+
     def forward(self,phasors, wls, normalize=False):
         # Phasors is the result of broadbandwavefront.get_phasors().
         # Ideally, that is run at the DiffOpticalSystem level, so these only need to
@@ -41,7 +43,7 @@ class DiffPupilOptic(DiffOpticalElement):
         phasors = phasors * wfe
     
         # Through amplitude transmission
-        new_phasor = phasors * self.amplitude
+        new_phasor = phasors * self.pupil_shifts(self.amplitude)
         if normalize:
             denom = new_phasor.abs() ** 2
             denom = torch.sum(denom, dim=(-2, -1), keepdim=True) ** 0.5

@@ -5,17 +5,17 @@ import numpy as np
 import math 
 
 class ShiftModule(nn.Module):
-    def __init__(self, height, width, learn_scale=False):
+    def __init__(self, height, width, learn_scale=False, device='cuda'):
         super(ShiftModule, self).__init__()
-        self.x_shift = nn.Parameter(torch.zeros(1), requires_grad=True)
-        self.y_shift = nn.Parameter(torch.zeros(1), requires_grad=True)
+        self.x_shift = nn.Parameter(torch.zeros(1).to(device), requires_grad=True)
+        self.y_shift = nn.Parameter(torch.zeros(1).to(device), requires_grad=True)
         y_coords, x_coords = torch.meshgrid(torch.arange(height), torch.arange(width), indexing='ij')
         grid = torch.stack((x_coords, y_coords), dim=-1).float()
         grid[:, :, 0] = 2.0 * grid[:, :, 0] / (width - 1) - 1.0
         grid[:, :, 1] = 2.0 * grid[:, :, 1] / (height - 1) - 1.0
-        self.grid = nn.Parameter(grid[None], requires_grad=False)
-        self.rotation = nn.Parameter(torch.zeros(1), requires_grad=True)
-        self.scale = nn.Parameter(torch.ones(1), requires_grad=learn_scale)
+        self.grid = nn.Parameter(grid[None].to(device), requires_grad=False)
+        self.rotation = nn.Parameter(torch.zeros(1).to(device), requires_grad=True)
+        self.scale = nn.Parameter(torch.ones(1).to(device), requires_grad=learn_scale)
 
     def forward(self, x):
         grid = self.grid.clone().to(x.dtype) * self.scale

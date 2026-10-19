@@ -50,12 +50,13 @@ def create_STPSF_model(from_obs=None, instrument='NIRCam', inst_params={'filter'
     
     # If we have a NIRCam round coron observation, use Kellen parameters to improve PSF fidelity: correct values ONLY in STPSF v2.2.0 and above
     # (i.e., after the NIRCam coronagraph OPDs were flipped for higher fidelity; see https://github.com/spacetelescope/stpsf/pull/125)
-    if inst_instance.channel == 'long' and inst_instance.pupil_mask == 'CIRCLYOT':
+    if inst_instance.channel == 'long' and inst_instance.pupil_mask in ['CIRCLYOT','MASKRND']:
         inst_instance.options['pupil_shift_x'] = -0.01346839
         inst_instance.options['pupil_shift_y'] = -0.00762122
         inst_instance.options['pupil_rotation'] = -0.56725767
+        print('AAAAAA')
         # nircam_instance.options['defocus_waves'] = -0.00162708# TODO: implement this in FLIP
-    elif inst_instance.channel == 'short' and inst_instance.pupil_mask == 'CIRCLYOT':
+    elif inst_instance.channel == 'short' and inst_instance.pupil_mask in ['CIRCLYOT','MASKRND']:
         inst_instance.options['pupil_shift_x'] =0.00898595
         inst_instance.options['pupil_shift_y'] = 0.00132024
         inst_instance.options['pupil_rotation'] = -0.08309628
