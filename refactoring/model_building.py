@@ -273,8 +273,8 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
     JWST_primary = DiffPupilOptic(name='JWSTPrimary',opd=entrance_OPD, amplitude=aperture,
                                 wfe_offsets=OPDOffsetModule(wf_npix, wf_npix, device=DEVICE))
     if babinet:
-        NIRCam_FPM = make_occulter(fpm, wlen_weights[0].cpu(), diameter / wf_npix, mount=mount, fpm_raster=fpm_raster,
-                                   um_per_arcsec=um_per_arcsec, name='NIRCam coron focal plane mask',
+        NIRCam_FPM = make_occulter(fpm, wlen_weights[0].cpu(), diameter / wf_npix, wf_npix, mount=mount, fpm_raster=fpm_raster,
+                                   um_per_arcsec=um_per_arcsec, device=DEVICE, name='NIRCam coron focal plane mask',
                                    axial_offset=fpm_axial_offset, focal_length=fpm_focal_length).to(DEVICE)
     else:
         NIRCam_FPM = DiffImageOptic(name='NIRCam coron focal plane mask',amplitude=torch.FloatTensor(fpm).to(DEVICE)[None],

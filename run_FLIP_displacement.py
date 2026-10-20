@@ -136,8 +136,8 @@ if __name__ == "__main__":
     lyot = torch.FloatTensor(lyot).to(DEVICE)[None]
     occulter = None
     if args.occulter == 'babinet':
-        occulter = make_occulter(fpm, wlen_weights[0], diameter / wf_npix, mount=not args.no_mount,
-                                 fpm_raster=args.fpm_raster, um_per_arcsec=args.um_per_arcsec).to(DEVICE)
+        occulter = make_occulter(fpm, wlen_weights[0], diameter / wf_npix, wf_npix, mount=not args.no_mount,
+                                 fpm_raster=args.fpm_raster, um_per_arcsec=args.um_per_arcsec, device=DEVICE).to(DEVICE)
     elif args.no_mount or args.fpm_raster is not None:
         raise ValueError('--no_mount and --fpm_raster need --occulter babinet')
     geometry['occulter'] = occulter
