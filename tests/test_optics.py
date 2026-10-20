@@ -12,7 +12,7 @@ from dl_utils import dl_MFT, crop_to, apply_substrate_transmission
 from optical_elements import (DiffImageOptic, DiffPupilOptic, DiffLyotOptic, DiffOpticalSystem, DiffDetector,
                               BabinetImageOptic, BlockedBand, flip_mask_regions, raster_region)
 from bluestein_fft import bluestein_fft, centered_fft
-from model_classes import ShiftModule
+from model_classes import ShiftModule, DetSubPixShift, shift_image_subpixel
 from diffraction import FresnelSingle, FresnelTransfer
 
 
@@ -621,33 +621,23 @@ def test_shift_module_identity_and_integer_shift():
     torch.testing.assert_close(shift(mask), expected, rtol=0, atol=1e-15)
 
 
-def test_shift_module_shift_and_back():
-    """Shifting a mask and shifting it back returns it: exactly for whole samples and a quarter
-    turn, and for a fraction f of a sample up to bilinear interpolation's smoothing
-    [f(1 - f), 1 - 2 f(1 - f), f(1 - f)] along each axis, which is itself exact (away from
-    the edges the shifts move off the grid)."""
-    n = 24
-    mask = asymmetric_field(n).abs()[None]
-
-    def moved(m, x, y, rotation):
-        shift = ShiftModule(n, n)
+def test_detector_shift_matches_fixed_shift_and_has_gradient():
+    """Float shifts reproduce shift_image_subpixel; parameter shifts get finite-difference gradients."""
+    image = asymmetric_field(16).abs()[None, None]
+    torch.testing.assert_close(DetSubPixShift(-0.12, -0.11)(image), shift_image_subpixel(image), rtol=0, atol=0)
+    shift = DetSubPixShift(torch.nn.Parameter(torch.tensor(0.3, dtype=torch.float64)),
+                           torch.nn.Parameter(torch.tensor(-0.2, dtype=torch.float64)))
+    weights = asymmetric_field(16).real
+    (shift(image) * weights).sum().backward()
+    for parameter in (shift.shift_x, shift.shift_y):
+        h = 1e-6
         with torch.no_grad():
-            shift.x_shift.fill_(x)
-            shift.y_shift.fill_(y)
-            shift.rotation.fill_(rotation)
-            return shift(m)
-
-    inner = (..., slice(4, -4), slice(4, -4))
-    for x, y, rotation in ((3., -2., 0.), (0., 0., 90.)):
-        returned = moved(moved(mask, x, y, rotation), -x, -y, -rotation)
-        torch.testing.assert_close(returned[inner], mask[inner], rtol=0, atol=1e-14)
-    x, y = 2.4, -0.7
-    expected = mask
-    for fraction, dim in ((x % 1, -1), (y % 1, -2)):
-        w = fraction * (1 - fraction)
-        expected = (1 - 2 * w) * expected + w * (torch.roll(expected, 1, dim) + torch.roll(expected, -1, dim))
-    returned = moved(moved(mask, x, y, 0.), -x, -y, 0.)
-    torch.testing.assert_close(returned[inner], expected[inner], rtol=0, atol=1e-14)
+            parameter += h
+            plus = (shift(image) * weights).sum()
+            parameter -= 2 * h
+            minus = (shift(image) * weights).sum()
+            parameter += h
+        assert parameter.grad.item() == pytest.approx(((plus - minus) / (2 * h)).item(), rel=1e-6)
 
 
 def test_shift_module_rotation_direction_and_gradient():

@@ -58,11 +58,11 @@ class DetSubPixShift(nn.Module):
 
         N, C, H, W = image.shape
 
-        # Create normalized 2D affine matrix for translation
-        theta = torch.tensor([[
-            [1, 0, -2 * self.shift_x / W],  # x shift
-            [0, 1, -2 * self.shift_y / H]   # y shift
-        ]], dtype=torch.double, device=image.device)
+        # Create normalized 2D affine matrix for translation; the shifts may be parameters
+        shift = torch.stack([torch.as_tensor(s, dtype=torch.double, device=image.device).reshape(())
+                             for s in (self.shift_x, self.shift_y)])
+        size = torch.tensor([W, H], dtype=torch.double, device=image.device)
+        theta = torch.cat([torch.eye(2, dtype=torch.double, device=image.device), (-2 * shift / size)[:, None]], dim=1)[None]
 
         # Repeat theta for batch
         theta = theta.expand(N, -1, -1)
@@ -71,7 +71,7 @@ class DetSubPixShift(nn.Module):
         grid = F.affine_grid(theta, size=image.size(), align_corners=False)
         shifted_image = F.grid_sample(image, grid, mode='bicubic', padding_mode='border', align_corners=False)
 
-        return shifted_image.squeeze(0) if shifted_image.size(0) == 1 else shifted_image  
+        return shifted_image.squeeze(0) if shifted_image.size(0) == 1 else shifted_image
 
 def shift_image_subpixel(image: torch.Tensor, shift_x: float = -0.12, shift_y: float = -0.11) -> torch.Tensor:
     """
