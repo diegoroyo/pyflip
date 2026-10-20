@@ -21,10 +21,16 @@ def jacobian_products(residual, theta):
         v -> J v, with J the Jacobian of residual at theta.
     vjp : callable
         u -> J^T u.
+
+    Notes
+    -----
+    J v is the vector-Jacobian product of the linear map u -> J^T u, so only reverse-mode
+    derivatives of the residual are needed.
     """
     r, vjp_fn = torch.func.vjp(residual, theta)
-    jvp = lambda v: torch.func.jvp(residual, (theta,), (v,))[1]
-    return r.detach(), jvp, lambda u: vjp_fn(u)[0]
+    transpose = lambda u: vjp_fn(u)[0]
+    jvp = lambda v: torch.func.vjp(transpose, torch.zeros_like(r))[1](v)[0].detach()
+    return r.detach(), jvp, lambda u: transpose(u).detach()
 
 
 def nuisance_projector(columns):
@@ -89,7 +95,7 @@ def conjugate_gradient(apply_A, b, n_iter, tol):
     return x, n, float(rr_new.sqrt()) / b_norm
 
 
-def minimum_norm_change(jvp, vjp, project, support, b, delta, n_iter=300, tol=1e-4):
+def minimum_norm_change(jvp, vjp, project, support, b, delta, n_iter=1000, tol=1e-3):
     """Smallest supported parameter change whose first-order residual change is b.
 
     Parameters
@@ -128,7 +134,7 @@ def minimum_norm_change(jvp, vjp, project, support, b, delta, n_iter=300, tol=1e
 
 
 def null_space_walk(residual, nuisance_columns, theta, support, steps, delta, budget, step_fraction=0.1,
-                    retractions=4, n_iter=300, tol=1e-4, verbose=False):
+                    retractions=4, n_iter=1000, tol=1e-3, verbose=False):
     """Remove the invisible part of the supported parameters while holding the residual near zero.
 
     Parameters
@@ -164,7 +170,7 @@ def null_space_walk(residual, nuisance_columns, theta, support, steps, delta, bu
     history : list of dict
         Per accepted step: step fraction, norm of the supported parameters, norm of their invisible
         part before the step, squared projected residual before and after retraction, the largest
-        number of conjugate-gradient iterations and the step's wall time [s].
+        number of conjugate-gradient iterations and relative residual, and the step's wall time [s].
     """
     def linearise(t):
         r, jvp, vjp = jacobian_products(residual, t)
@@ -178,18 +184,20 @@ def null_space_walk(residual, nuisance_columns, theta, support, steps, delta, bu
 
     history, a, start = [], step_fraction, time.time()
     while len(history) < steps and a > step_fraction / 64:
-        t0, cg = time.time(), []
+        t0, cg, cg_rel = time.time(), [], []
         _, jvp, vjp, project = linearise(theta)
         s = support * theta
-        visible, n, _ = minimum_norm_change(jvp, vjp, project, support, jvp(s), delta, n_iter, tol)
+        visible, n, rel = minimum_norm_change(jvp, vjp, project, support, jvp(s), delta, n_iter, tol)
         cg.append(n)
+        cg_rel.append(rel)
         invisible = s - visible
         trial = theta - a * invisible
         r, jvp, vjp, project = linearise(trial)
         before = float(r @ r)
         for _ in range(retractions):
-            dtheta, n, _ = minimum_norm_change(jvp, vjp, project, support, r, delta, n_iter, tol)
+            dtheta, n, rel = minimum_norm_change(jvp, vjp, project, support, r, delta, n_iter, tol)
             cg.append(n)
+            cg_rel.append(rel)
             for c in (1., 0.5, 0.25, 0.1):
                 if cost_at(trial - c * dtheta, project) < float(r @ r):
                     break
@@ -200,13 +208,14 @@ def null_space_walk(residual, nuisance_columns, theta, support, steps, delta, bu
         after = float(r @ r)
         accept = after <= budget
         if verbose:
-            print('%s a %.3f: |theta| %.4g, invisible %.4g, |W r|^2 %.3g -> %.3g, CG max %d, %.1f s'
+            print('%s a %.3f: |theta| %.4g, invisible %.4g, |W r|^2 %.3g -> %.3g, CG max %d it, residual %.1e, %.1f s'
                   % ('step %d' % (len(history) + 1) if accept else 'rejected', a, float(s.norm()),
-                     float(invisible.norm()), before, after, max(cg), time.time() - t0), flush=True)
+                     float(invisible.norm()), before, after, max(cg), max(cg_rel), time.time() - t0), flush=True)
         if accept:
             theta = trial
             history.append(dict(step_fraction=a, norm=float((support * theta).norm()), invisible=float(invisible.norm()),
-                                cost_before=before, cost_after=after, cg_max=max(cg), time=time.time() - t0))
+                                cost_before=before, cost_after=after, cg_max=max(cg), cg_residual=max(cg_rel),
+                                time=time.time() - t0))
             a = min(step_fraction, 1.5 * a)
         else:
             a = a / 2

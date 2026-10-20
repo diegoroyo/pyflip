@@ -1,7 +1,20 @@
 """Null-space walk on a linear model and on a small Fraunhofer imaging system."""
 import torch
 
-from null_space import null_space_walk, nuisance_projector
+from null_space import null_space_walk, nuisance_projector, jacobian_products
+
+
+def test_jacobian_products_match_full_jacobian():
+    """J v and J^T u from reverse mode alone equal products with the full Jacobian."""
+    torch.manual_seed(1)
+    A = torch.randn(7, 5, dtype=torch.float64)
+    residual = lambda t: torch.sin(A @ t) * torch.exp(0.3 * (A @ t))
+    theta, v, u = torch.randn(5, dtype=torch.float64), torch.randn(5, dtype=torch.float64), torch.randn(7, dtype=torch.float64)
+    J = torch.autograd.functional.jacobian(residual, theta)
+    r, jvp, vjp = jacobian_products(residual, theta)
+    torch.testing.assert_close(r, residual(theta), rtol=0, atol=0)
+    torch.testing.assert_close(jvp(v), J @ v, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(vjp(u), J.T @ u, rtol=1e-12, atol=1e-12)
 
 
 def test_full_step_on_linear_model_reaches_minimum_norm_solution():
