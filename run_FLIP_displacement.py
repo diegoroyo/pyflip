@@ -112,6 +112,7 @@ if __name__ == "__main__":
     parser.add_argument('--fpm_raster', default=None, type=str, help='mask raster file (Babinet only)')
     parser.add_argument('--um_per_arcsec', default=593.336, type=float, help='mask scale for --fpm_raster [um/arcsec]')
     parser.add_argument('--fine_raster', action='store_true', help='use every raster sample instead of the band-limited mask (slow)')
+    parser.add_argument('--double', action='store_true', help='complex128 fields instead of complex64')
     parser.add_argument('--lyot_lr', default=1e-3, type=float, help='Lyot shift [samples] and rotation [deg] learning rate')
 
     args = parser.parse_args()
@@ -143,6 +144,7 @@ if __name__ == "__main__":
     elif args.no_mount or args.fpm_raster is not None:
         raise ValueError('--no_mount and --fpm_raster need --occulter babinet')
     geometry['occulter'] = occulter
+    geometry['dtype'] = torch.complex128 if args.double else torch.complex64
     fpm = torch.FloatTensor(fpm).to(DEVICE)[None]
     wlen_weights = torch.as_tensor(wlen_weights, dtype=torch.float64, device=DEVICE)
 

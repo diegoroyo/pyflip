@@ -677,3 +677,16 @@ def test_stages_fit_geometry_on_reference_only():
             assert all(float(parameter.grad.abs().max()) == expected for parameter in parameters)
         else:
             assert all(parameter.grad is None for parameter in parameters)
+
+
+def test_babinet_complex64_keeps_dtype_and_precision():
+    """The occulter keeps a complex64 field in complex64, at single-precision accuracy."""
+    n = 16
+    mask = occulter_mask(2 * n)
+    optic = BabinetImageOptic(flip_mask_regions(mask), axial_offset=0.002, focal_length=1.)
+    field = torch.stack([asymmetric_field(n), 1j * asymmetric_field(n)])[None]
+    wavelengths = torch.tensor([4e-6, 5e-6], dtype=torch.float64)
+    double = optic(field, n, 2, wavelengths=wavelengths, d_pupil=0.01)
+    single = optic(field.to(torch.complex64), n, 2, wavelengths=wavelengths, d_pupil=0.01)
+    assert single.dtype == torch.complex64
+    assert torch.linalg.vector_norm(single - double) < 1e-5 * torch.linalg.vector_norm(double - field)

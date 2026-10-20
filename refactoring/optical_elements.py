@@ -337,12 +337,12 @@ class BabinetImageOptic(DiffOpticalElement):
     def forward(self, phasor, npixels_in, oversample=2, wavelengths=None, d_pupil=None, crop_output=True):
         """Field at the second pupil, on npixels_in samples, or npixels_in * oversample if not cropped."""
         n_out = npixels_in if crop_output else npixels_in * oversample
-        field = phasor.to(torch.complex128)
+        field = phasor
         if self.axial_offset is not None:
-            field = field * self.defocus(npixels_in, wavelengths, d_pupil)
+            field = field * self.defocus(npixels_in, wavelengths, d_pupil).to(field.dtype)
         blocked = sum(region.propagate(field, n_out) for region in self.regions)
         if self.axial_offset is not None:
-            blocked = blocked * self.defocus(n_out, wavelengths, d_pupil).conj()
+            blocked = blocked * self.defocus(n_out, wavelengths, d_pupil).conj().to(field.dtype)
         return torch.nn.functional.pad(phasor, ((n_out - npixels_in) // 2,) * 4) - blocked
 
     def defocus(self, n, wavelengths, d_pupil):

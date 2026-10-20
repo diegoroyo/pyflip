@@ -190,7 +190,7 @@ class BroadbandWavefront(nn.Module):
         return new_phasor
 
     def forward_wfes(self, phasors, layer, wlens):
-        wfe = torch.exp(1j * layer.unsqueeze(0) * 2 * np.pi / wlens.unsqueeze(1).unsqueeze(2))
+        wfe = torch.exp(1j * layer.unsqueeze(0) * 2 * np.pi / wlens.unsqueeze(1).unsqueeze(2)).to(phasors.dtype)
         new_phasor = phasors * wfe
         return new_phasor
 
@@ -207,9 +207,11 @@ class PointPropagate(nn.Module):
     occulter : BabinetImageOptic, optional
         Focal plane mask applied through Babinet's principle. None uses the
         transmission `fpm` on the full padded focal grid.
+    dtype : torch.dtype, optional
+        Complex dtype of the fields; None keeps the inputs' precision.
     """
     def __init__(self, aperture, lyot, fpm, nircam_opd, args,oversample=None, use_ptt = None,OTE_wfe_basis=None,second_delta_wfe=None, num_det_px = 80,
-                 fpm_axial_offset=None, lyot_axial_offset=None, focal_length=131.4, occulter=None):
+                 fpm_axial_offset=None, lyot_axial_offset=None, focal_length=131.4, occulter=None, dtype=None):
         super().__init__()
         self.aperture = aperture
         self.lyot = lyot
@@ -264,8 +266,9 @@ class PointPropagate(nn.Module):
             args = (npixels, wavelengths[i].item(), true_pixel_scale, psf_npix*self.oversample, psf_pixel_scale/self.oversample, focal_length, shift, pixel, inverse)
             x_mat, y_mat, mult = partial_MFT(*args)
             xmats.append(x_mat); ymats.append(y_mat); mults.append(torch.tensor(mult, dtype=torch.float64))
-        self.x_mat = nn.Parameter(torch.stack(xmats), requires_grad=False)
-        self.y_mat = nn.Parameter(torch.stack(ymats), requires_grad=False)
+        self.dtype = dtype
+        self.x_mat = nn.Parameter(torch.stack(xmats).to(dtype or xmats[0].dtype), requires_grad=False)
+        self.y_mat = nn.Parameter(torch.stack(ymats).to(dtype or ymats[0].dtype), requires_grad=False)
         self.mult = nn.Parameter(torch.stack(mults), requires_grad=False)
 
     def propagate_masks(self, phasors, wavefront):
@@ -291,13 +294,15 @@ class PointPropagate(nn.Module):
             wfe_ = self.second_wfe_offsets(wfe_)
 
         phasors = broadbandwavefront.get_phasors(self.angle_offsets())
+        if self.dtype is not None:
+            phasors = phasors.to(self.dtype)
         phasors = broadbandwavefront.forward_wfes(phasors, wfe_, broadbandwavefront.wavelengths)
         phasors_ap = broadbandwavefront.forward(phasors, self.aperture, normalize=True)
         phasors_lyot = self.propagate_masks(phasors_ap, broadbandwavefront)
         phasors_nircam_opd = broadbandwavefront.forward_wfes(phasors_lyot, self.nircam_offsets(self.nircam_opd), broadbandwavefront.wavelengths)
         phasor = (self.y_mat.transpose(-2, -1) @ phasors_nircam_opd) @ self.x_mat
 
-        phasor *= self.mult.view(1, 1, -1, 1, 1)
+        phasor = phasor * self.mult.view(1, 1, -1, 1, 1).to(phasor.real.dtype)
         w = (broadbandwavefront.peak_flux) ** 0.5
         out = (torch.abs(phasor) * w) ** 2 
 
