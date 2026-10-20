@@ -32,6 +32,7 @@ lyot_file = os.environ['LYOT_FILE']                          # stpsf's MASKRND t
 out_dir = os.environ.get('OUT_DIR', 'science_chi2')
 cases = os.environ.get('CASES', 'real593_bl_sq,real637_bl_sq').split(',')
 iters = int(os.environ.get('ITERS', 300))
+substrate = os.environ.get('SUBSTRATE', '1') == '1'           # band weights x the mask substrate's transmission
 fpm_focal_length = 131.4                                     # equivalent focal length [m]
 um_per_arcsec = {'593': 593.336, '637': 637.045}
 
@@ -55,7 +56,7 @@ def load_frame(path):
 
 
 data = [load_frame(path) for _, path in frames]
-_, _, _, _, wlen_weights, _ = load_model_data(data_dir=frames[0][0])
+_, _, _, _, wlen_weights, _ = load_model_data(data_dir=frames[0][0], substrate=substrate)
 lyot_amplitude = torch.FloatTensor(np.load(lyot_file)).to(DEVICE)[None]
 geometry_file = np.load(os.path.join(geometry_dir, 'geometry_cases.npz'))
 fitted = {case: dict(zip(geometry_file['keys'], values)) for case, values in zip(geometry_file['cases'], geometry_file['values'])}
