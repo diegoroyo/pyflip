@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from dl_utils import dl_MFT, crop_to
 from optical_elements import DiffImageOptic, DiffPupilOptic, DiffLyotOptic, DiffOpticalSystem, DiffDetector
 from bluestein_fft import bluestein_fft, centered_fft
+from model_classes import ShiftModule
 from diffraction import FresnelSingle, FresnelTransfer
 
 
@@ -424,3 +425,40 @@ def test_optimizer_recovers_injected_offset(element, true_offset):
         losses.append(loss.item())
     assert losses[-1] < losses[0] * 1e-5
     assert offset.item() == pytest.approx(true_offset, rel=0.01)
+
+
+def test_shift_module_identity_and_integer_shift():
+    mask = asymmetric_field(12).abs()[None]
+    shift = ShiftModule(12, 12)
+    torch.testing.assert_close(shift(mask), mask, rtol=0, atol=1e-15)
+    with torch.no_grad():
+        shift.x_shift.fill_(2.)
+        shift.y_shift.fill_(-1.)
+    expected = torch.roll(mask, (-1, 2), (-2, -1))
+    expected[..., -1:, :] = 0.
+    expected[..., :, :2] = 0.
+    torch.testing.assert_close(shift(mask), expected, rtol=0, atol=1e-15)
+
+
+def test_shift_module_rotation_direction_and_gradient():
+    """+90 deg turns +x into +y; shift and rotation gradients match finite differences."""
+    mask = torch.zeros(1, 9, 9, dtype=torch.float64)
+    mask[0, 4, 7] = 1.                                       # on the +x axis
+    shift = ShiftModule(9, 9)
+    with torch.no_grad():
+        shift.rotation.fill_(90.)
+    assert shift(mask)[0, 7, 4].item() == pytest.approx(1.)         # now on the +y axis
+    mask = asymmetric_field(9).abs()[None]
+    with torch.no_grad():
+        shift.rotation.fill_(3.)
+        shift.x_shift.fill_(0.3)
+    for parameter in (shift.rotation, shift.x_shift):
+        derivative, = torch.autograd.grad(shift(mask)[0, 3, 5], parameter)
+        with torch.no_grad():
+            parameter += 1e-6
+            plus = shift(mask)[0, 3, 5]
+            parameter -= 2e-6
+            minus = shift(mask)[0, 3, 5]
+            parameter += 1e-6
+        assert abs(derivative) > 1e-4
+        torch.testing.assert_close(derivative[0], (plus - minus) / 2e-6, rtol=1e-6, atol=1e-9)

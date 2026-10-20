@@ -35,7 +35,7 @@ class DiffPupilOptic(DiffOpticalElement):
         else:
             self.wfe_offsets = wfe_offsets
 
-        self.pupil_shifts = ShiftModule(amplitude.shape[-2], amplitude.shape[-1])
+        self.pupil_shifts = ShiftModule(amplitude.shape[-2], amplitude.shape[-1], device=amplitude.device)
 
     def forward(self,phasors, wls, normalize=False):
         # Phasors is the result of broadbandwavefront.get_phasors().
@@ -49,13 +49,17 @@ class DiffPupilOptic(DiffOpticalElement):
         phasors = phasors * wfe
     
         # Through amplitude transmission
-        new_phasor = phasors * self.pupil_shifts(self.amplitude)
+        new_phasor = phasors * self.transmission()
         if normalize:
             denom = new_phasor.abs() ** 2
             denom = torch.sum(denom, dim=(-2, -1), keepdim=True) ** 0.5
         else:
             denom = 1.
         return new_phasor / denom
+
+    def transmission(self):
+        """Amplitude transmission after pupil_shifts."""
+        return self.pupil_shifts(self.amplitude)
     
 
 class DiffLyotOptic(DiffPupilOptic):
@@ -66,6 +70,8 @@ class DiffLyotOptic(DiffPupilOptic):
     axial_offset : torch.nn.Parameter or None
         Stop displacement [m] in the equivalent optical system used for pupil
         sampling. Positive values move downstream. None uses the nominal stop.
+    pupil_shifts : ShiftModule
+        Shift and rotation of the stop transmission.
 
     The OPD remains at the nominal pupil plane, after propagation back from the
     displaced stop. Only the amplitude transmission moves with the stop.
@@ -121,7 +127,7 @@ class DiffLyotOptic(DiffPupilOptic):
         n_pad = phasors.shape[-1] - n_stop
         if n_pad < 0 or n_pad % 2:
             raise ValueError('pupil field must contain the stop on a grid of matching parity')
-        transmission = torch.nn.functional.pad(self.amplitude, (n_pad // 2,) * 4)
+        transmission = torch.nn.functional.pad(self.transmission(), (n_pad // 2,) * 4)
         wavelengths = wls.to(device=phasors.device, dtype=torch.float64)
         propagators = [FresnelTransfer(d_pupil, wl) for wl in wavelengths]
 

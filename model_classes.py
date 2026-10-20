@@ -5,33 +5,43 @@ import numpy as np
 import math 
 
 class ShiftModule(nn.Module):
-    def __init__(self, height, width, learn_scale=False):
+    """Shift, rotation and magnification of a mask about the grid centre, by bilinear resampling.
+
+    Attributes
+    ----------
+    x_shift, y_shift : torch.nn.Parameter
+        Shift [samples], positive towards larger column / row indices.
+    rotation : torch.nn.Parameter
+        Rotation [deg], positive from +x towards +y.
+    scale : torch.nn.Parameter
+        Magnification.
+    """
+    def __init__(self, height, width, learn_scale=False, device=None):
         super(ShiftModule, self).__init__()
-        self.x_shift = nn.Parameter(torch.zeros(1), requires_grad=True)
-        self.y_shift = nn.Parameter(torch.zeros(1), requires_grad=True)
-        y_coords, x_coords = torch.meshgrid(torch.arange(height), torch.arange(width), indexing='ij')
-        grid = torch.stack((x_coords, y_coords), dim=-1).float()
-        grid[:, :, 0] = 2.0 * grid[:, :, 0] / (width - 1) - 1.0
-        grid[:, :, 1] = 2.0 * grid[:, :, 1] / (height - 1) - 1.0
-        self.grid = nn.Parameter(grid[None], requires_grad=False)
-        self.rotation = nn.Parameter(torch.zeros(1), requires_grad=True)
-        self.scale = nn.Parameter(torch.ones(1), requires_grad=learn_scale)
+        self.x_shift = nn.Parameter(torch.zeros(1, dtype=torch.float64), requires_grad=True)
+        self.y_shift = nn.Parameter(torch.zeros(1, dtype=torch.float64), requires_grad=True)
+        self.rotation = nn.Parameter(torch.zeros(1, dtype=torch.float64), requires_grad=True)
+        self.scale = nn.Parameter(torch.ones(1, dtype=torch.float64), requires_grad=learn_scale)
+        y = torch.arange(height, dtype=torch.float64) - (height - 1) / 2
+        x = torch.arange(width, dtype=torch.float64) - (width - 1) / 2
+        self.register_buffer('y', y[:, None].expand(height, width).clone())
+        self.register_buffer('x', x[None, :].expand(height, width).clone())
+        if device is not None:
+            self.to(device)
 
-    def forward(self, x):
-        grid = self.grid.clone().to(x.dtype) * self.scale
-
-        cos_theta = torch.cos(self.rotation)
-        sin_theta = torch.sin(self.rotation)
-        rotation_matrix = torch.tensor([[cos_theta, -sin_theta], [sin_theta, cos_theta]]).to(x.device).to(x.dtype)
-        grid = torch.matmul(grid.view(-1, 2), rotation_matrix).view(1, x.shape[-2], x.shape[-1], 2)
-
-        grid[..., 0] = grid[..., 0] + self.x_shift
-        grid[..., 1] = grid[..., 1] + self.y_shift
-
-        out = F.grid_sample(x[None], grid, mode='bilinear', padding_mode='reflection', align_corners=False)
-
-        return out[0]
-    
+    def forward(self, mask):
+        """Moved mask, shape (..., height, width)."""
+        height, width = mask.shape[-2:]
+        angle = torch.deg2rad(self.rotation)
+        cos, sin = torch.cos(angle), torch.sin(angle)
+        x = (self.x - self.x_shift) / self.scale
+        y = (self.y - self.y_shift) / self.scale
+        # Input position of each output sample; -1 and +1 are the outer grid edges (align_corners=False).
+        grid = torch.stack(((cos * x + sin * y) * 2 / width, (-sin * x + cos * y) * 2 / height), dim=-1)
+        flat = mask.reshape(-1, 1, height, width).to(grid.dtype)
+        out = F.grid_sample(flat, grid[None].expand(len(flat), -1, -1, -1), mode='bilinear', padding_mode='zeros',
+                            align_corners=False)
+        return out.reshape(mask.shape).to(mask.dtype)
 
 class GridOffsetModule(nn.Module):
     def __init__(self, height, width):
