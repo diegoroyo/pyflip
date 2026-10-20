@@ -62,7 +62,8 @@ lyot_amplitude = torch.FloatTensor(np.load(lyot_file)).to(DEVICE)[None]
 geometry_file = np.load(os.path.join(geometry_dir, 'geometry_cases.npz'))
 fitted = {case: dict(zip(geometry_file['keys'], values)) for case, values in zip(geometry_file['cases'], geometry_file['values'])}
 geometries = {'PyFLIP as shipped': ('flip', None)}
-geometries.update({'fitted, ' + case: (case, fitted[case.replace('_sq', '')]) for case in cases if case.replace('_sq', '') in fitted})
+geometries.update({'fitted, ' + case: (case, fitted[case if case in fitted else case.replace('_sq', '')])
+                   for case in cases if case in fitted or case.replace('_sq', '') in fitted})
 
 
 #### MODEL AND FIT

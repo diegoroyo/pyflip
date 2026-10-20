@@ -9,7 +9,8 @@ as FRAMES = 'model_dir:data_file,model_dir:data_file,...'; without FRAMES, the f
 MODEL_DIR:REF_FILE.
 
 Cases: the smooth MASK335R profile and the real mask raster (every cell, and
-band-limited), each with the mask at 593.336 and 637.045 um/arcsec on the sky. The
+band-limited; '_sq' appended treats its samples as square cells), each with the mask at
+593.336 and 637.045 um/arcsec on the sky. The
 smooth profile is drawn as a raster at its design scale (593.336 um/arcsec), so all
 cases go through the same raster occulter. The mount is dropped. The Lyot stop is
 LYOT_FILE (stpsf's MASKRND as stored), moved by the fitted shift and clocking.
@@ -110,7 +111,7 @@ def build(case):
             instrument = assemble_JWST_NIRCam_coron(model_dir, num_det_px, DEVICE=DEVICE, oversample=oversample, babinet=True,
                                                     mount=False, fpm_raster=smooth_path if mask == 'smooth' else fpm_raster,
                                                     um_per_arcsec=um_per_arcsec[scale],
-                                                    band_limited=mask == 'smooth' or case.endswith('_bl'),
+                                                    band_limited=mask == 'smooth' or '_bl' in case, square_cells=case.endswith('_sq'),
                                                     fpm_axial_offset=fpm_axial_start, fpm_focal_length=fpm_focal_length)
         for parameter in list(wavefront.parameters()) + list(instrument.parameters()):
             parameter.requires_grad_(False)

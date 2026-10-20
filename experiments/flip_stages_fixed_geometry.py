@@ -7,7 +7,9 @@ held-out reference frames.
 CASE: a mask of fit_geometry_cases.py with its fitted geometry and the stop LYOT_FILE;
 '_sq' appended treats the band-limited raster's samples as square cells. CASE=flip is
 PyFLIP as shipped: its mask file (FFT occulter, with the mount), the model's stop, no
-FPM axial offset, its registration and blur.
+FPM axial offset, its registration and blur. LOSS=chi2 replaces testing.py's smooth L1 /
+L1 losses and window flux rule by the noise-weighted chi^2 with the flux solved in closed
+form at every iteration.
 
 Run from refactoring/ (inject_fake_planets reads data/ relative to the working
 directory). Paths and options below, or from the environment variables named there.
@@ -38,6 +40,7 @@ geometry_dir = os.environ.get('GEOMETRY_DIR')                # output of fit_geo
 fpm_raster = os.environ.get('FPM_RASTER')                    # real mask raster (.npz)
 lyot_file = os.environ.get('LYOT_FILE')                      # stpsf's MASKRND transmission, 1024 x 1024
 out_dir = os.environ.get('OUT_DIR', 'flip_stages_' + case)
+loss_kind = os.environ.get('LOSS', 'flip')                   # flip (testing.py) | chi2
 companion = [float(c) for c in os.environ.get('COMPANION', '-8.5,9.5').split(',')]   # in the first roll, from the array centre [px]
 fpm_focal_length = 131.4                                     # equivalent focal length [m]
 um_per_arcsec = {'593': 593.336, '637': 637.045}
@@ -65,7 +68,8 @@ if case == 'flip':
     diffnircam = assemble_JWST_NIRCam_coron(data_dir, num_det_px, DEVICE=DEVICE)
 else:
     geometry_file = np.load(os.path.join(geometry_dir, 'geometry_cases.npz'))
-    geometry = dict(zip(geometry_file['keys'], geometry_file['values'][list(geometry_file['cases']).index(case.replace('_sq', ''))]))
+    fitted_cases = list(geometry_file['cases'])
+    geometry = dict(zip(geometry_file['keys'], geometry_file['values'][fitted_cases.index(case if case in fitted_cases else case.replace('_sq', ''))]))
     mask, scale = case.split('_')[0][:-3], case.split('_')[0][-3:]
     diffnircam = assemble_JWST_NIRCam_coron(data_dir, num_det_px, DEVICE=DEVICE, babinet=True, mount=False,
                                             fpm_raster=os.path.join(geometry_dir, 'smooth_MASK335R_raster.npz') if mask == 'smooth' else fpm_raster,
@@ -101,9 +105,12 @@ px_mask = torch.from_numpy(px_mask_numpy).to(DEVICE)[None]
 ref, ref_noise = load_and_crop_data(refdatapath, num_det_px=num_det_px, coron_type='MASK335R')
 sci, sci_noise = load_and_crop_data(sci_files[0], num_det_px=num_det_px, coron_type='MASK335R')
 fakes = [{'pos_x_px': 10., 'pos_y_px': 0.}]                   # testing.py's injected planet, relative to the array centre [px]
-sci, injected_fluxes = inject_fake_planets(sci, sci_noise, wavefront_broad, diffnircam, fakes, 5, smooth_sigma_for_flux=1.)
-ref = torch.from_numpy(ref).to(DEVICE)
-sci = torch.from_numpy(sci).to(DEVICE)
+sci, injected_fluxes = inject_fake_planets(sci, sci_noise, wavefront_broad, diffnircam, fakes, 5, smooth_sigma_for_flux=1., DEVICE=DEVICE)
+ref_weights, sci_weights = [torch.from_numpy(np.where((px_mask_numpy > 0) & np.isfinite(data) & (noise > 0),
+                                                      1 / np.where(noise > 0, noise, 1.)**2, 0.)).to(DEVICE)
+                            for data, noise in ((ref, ref_noise), (sci, sci_noise))]
+ref = torch.from_numpy(np.nan_to_num(ref)).to(DEVICE)
+sci = torch.from_numpy(np.nan_to_num(sci)).to(DEVICE)
 
 
 def load_scored(path):
@@ -121,15 +128,20 @@ snrs_arr, track_iters = [], []
 for i in tqdm.tqdm(range(scheduler_iters + 1), mininterval=30.0):
     optimizer.zero_grad()
     PSF = diffnircam(wavefront_broad)
-    if i < stage_cutoffs[2]:
-        loss = F.smooth_l1_loss(PSF, ref, reduction='none')
+    if loss_kind == 'chi2':
+        data, weights = (ref, ref_weights) if i < stage_cutoffs[2] else (sci, sci_weights)
+        PSF = PSF * ((weights * PSF * data).sum() / (weights * PSF**2).sum()).detach()
+        loss = (weights * (PSF - data)**2).sum() / (weights > 0).sum() * (1. if i < stage_cutoffs[2] else sci_loss_weight)
     else:
-        loss = F.l1_loss(PSF, sci, reduction='none') * sci_loss_weight
-    loss = (loss * px_mask).sum() / px_mask.sum()
+        if i < stage_cutoffs[2]:
+            loss = F.smooth_l1_loss(PSF, ref, reduction='none')
+        else:
+            loss = F.l1_loss(PSF, sci, reduction='none') * sci_loss_weight
+        loss = (loss * px_mask).sum() / px_mask.sum()
     loss.backward()
-    if i < stage_cutoffs[0]:
+    if loss_kind != 'chi2' and i < stage_cutoffs[0]:
         wavefront_broad = hardcoded_match_flux(PSF, ref, px_mask, wavefront_broad)
-    elif i > stage_cutoffs[2] and i < stage_cutoffs[3]:
+    elif loss_kind != 'chi2' and i > stage_cutoffs[2] and i < stage_cutoffs[3]:
         wavefront_broad = hardcoded_match_flux(PSF, sci, px_mask, wavefront_broad)
     default_stages(diffnircam, wavefront_broad, i, stage_cutoffs=stage_cutoffs)
     optimizer.step()
@@ -200,7 +212,7 @@ for path in held_files:
         for angle in injection_angles:
             planet = [{'pos_x_px': sep * np.cos(np.radians(angle)), 'pos_y_px': sep * np.sin(np.radians(angle))}]
             injected, flux = inject_fake_planets(np.zeros_like(residual), frame[1][None], wavefront, calibrated, planet, 5,
-                                                 smooth_sigma_for_flux=1.)
+                                                 smooth_sigma_for_flux=1., DEVICE=DEVICE)
             injection_snr[sep].append(track_SNR(residual + injected, 0, planet, flux, mask_name='MASK335R', snr_smooth_sigma=1.,
                                                 px_mask_numpy=px_mask_numpy, save_plot=False)[2][0])
 scores['held-out chi2/N'] = float(np.mean(held_chi2))
