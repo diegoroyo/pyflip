@@ -1,7 +1,8 @@
 """Null-space walk on a linear model and on a small Fraunhofer imaging system."""
 import torch
 
-from null_space import null_space_walk, nuisance_projector, jacobian_products
+from null_space import (null_space_walk, nuisance_projector, jacobian_products, conjugate_gradient,
+                        nystrom_preconditioner)
 
 
 def test_jacobian_products_match_full_jacobian():
@@ -15,6 +16,22 @@ def test_jacobian_products_match_full_jacobian():
     torch.testing.assert_close(r, residual(theta), rtol=0, atol=0)
     torch.testing.assert_close(jvp(v), J @ v, rtol=1e-12, atol=1e-12)
     torch.testing.assert_close(vjp(u), J.T @ u, rtol=1e-12, atol=1e-12)
+
+
+def test_nystrom_preconditioner_speeds_up_conjugate_gradients():
+    """A Nystrom preconditioner covering the eigenvalues above delta cuts the CG iterations, same solution."""
+    torch.manual_seed(2)
+    m, delta = 200, 1e-6
+    Q = torch.linalg.qr(torch.randn(m, m, dtype=torch.float64))[0]
+    K = Q @ torch.diag(10.0**torch.linspace(4, -10, m, dtype=torch.float64)) @ Q.T
+    apply_A = lambda x: K @ x + delta * x
+    b = torch.randn(m, dtype=torch.float64)
+    exact = torch.linalg.solve(K + delta * torch.eye(m, dtype=torch.float64), b)
+    _, n_plain, _ = conjugate_gradient(apply_A, b, 500, 1e-8)
+    x, n_pre, rel = conjugate_gradient(apply_A, b, 500, 1e-8, nystrom_preconditioner(lambda x: K @ x, m, 160, delta))
+    assert n_pre < n_plain / 10
+    assert rel <= 1e-8
+    torch.testing.assert_close(x, exact, rtol=1e-6, atol=1e-6 * float(exact.norm()))
 
 
 def test_full_step_on_linear_model_reaches_minimum_norm_solution():
