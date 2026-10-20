@@ -3,11 +3,12 @@
 Run from the repository root with: python -m pytest -q
 pytest.ini selects the refactored modules. No instrument files or fitting needed.
 """
+import numpy as np
 import pytest
 import torch
 from types import SimpleNamespace
 
-from dl_utils import dl_MFT, crop_to
+from dl_utils import dl_MFT, crop_to, apply_substrate_transmission
 from optical_elements import (DiffImageOptic, DiffPupilOptic, DiffLyotOptic, DiffOpticalSystem, DiffDetector,
                               BabinetImageOptic, BlockedBand, flip_mask_regions, raster_region)
 from bluestein_fft import bluestein_fft, centered_fft
@@ -574,6 +575,18 @@ def test_band_limited_raster_matches_fine_sum(crop_output):
                                                                                                crop_output=crop_output)
     padded = torch.nn.functional.pad(field, ((expected.shape[-1] - n) // 2,) * 4)
     assert torch.linalg.vector_norm(actual - expected) < 1e-6 * torch.linalg.vector_norm(expected - padded)
+
+
+def test_substrate_transmission_reweights_band():
+    """Weights keep their sum, are unchanged where the substrate is flat (3.9-4.1 um) and fall
+    at the red end of F444W, where it transmits less; one wavelength is left as it is."""
+    flat = np.array([np.linspace(3.90e-6, 4.08e-6, 5), np.full(5, 0.2)])
+    np.testing.assert_allclose(apply_substrate_transmission(flat), flat, rtol=2e-3)
+    band = np.array([np.linspace(3.9e-6, 4.9e-6, 11), np.full(11, 1 / 11)])
+    weights = apply_substrate_transmission(band)[1]
+    assert weights.sum() == pytest.approx(1.)
+    assert weights[-1] < 0.9 * weights[0]
+    np.testing.assert_allclose(apply_substrate_transmission([[4.4e-6], [1.]]), [[4.4e-6], [1.]])
 
 
 def test_shift_module_identity_and_integer_shift():

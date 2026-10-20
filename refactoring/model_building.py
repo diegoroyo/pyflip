@@ -1,5 +1,5 @@
 import torch
-from dl_utils import load_model_data,arcsec2rad
+from dl_utils import load_model_data, arcsec2rad, apply_substrate_transmission
 import numpy as np 
 import torch.nn.functional as F
 import torch.nn as nn
@@ -67,7 +67,7 @@ def create_STPSF_model(from_obs=None, instrument='NIRCam', inst_params={'filter'
 
 
 def generate_STPSF_model_params(stpsf_instrument, spec_type='A1V', catalog_spec='phoenix', input_spectrum=None, 
-                                num_wl=21,oversample=2, folder_to_save='mydata',return_data=False):
+                                num_wl=21,oversample=2, folder_to_save='mydata',return_data=False, substrate=True):
     """
     Take a STPSF instrument and create FLIP-friendly model parameters.
 
@@ -87,6 +87,10 @@ def generate_STPSF_model_params(stpsf_instrument, spec_type='A1V', catalog_spec=
 
     As a rule of thumb, we typically use 21 wavelengths for wide filters and 9 wavelengths for medium filters,
     but this has not been rigorously optimized. 
+
+    substrate=True multiplies the band weights by the transmission of the coronagraph mask
+    substrate (module A, measured; see dl_utils.apply_substrate_transmission), which STPSF's
+    weights lack; instrument_config.json records it as 'substrate_in_weights'.
     """
     npix=1024 * int(oversample) # Image plane pixels: this is oversampling of 2. Pupil plane is always in 1024x1024 pixels for simplicity
     
@@ -139,7 +143,9 @@ def generate_STPSF_model_params(stpsf_instrument, spec_type='A1V', catalog_spec=
             wlens_weights.append(psf_nircam_instance[0].header[attribute])
 
     wlen_wlen_we_arr = np.array([wlens, wlens_weights])
-    wlen_wlen_we_arr
+    substrate = substrate and stpsf_instrument.image_mask is not None and stpsf_instrument.module == 'A'
+    if substrate:
+        wlen_wlen_we_arr = apply_substrate_transmission(wlen_wlen_we_arr)
 
     wavelengths_folder = os.path.join(folder_oversample_and_wl_num, 'wlens_weights')
 
@@ -199,6 +205,7 @@ def generate_STPSF_model_params(stpsf_instrument, spec_type='A1V', catalog_spec=
     prop_dict['pupil_rotation'] = stpsf_instrument.options['pupil_rotation']
     prop_dict['img_oversample'] = oversample
     prop_dict['num_wl'] = num_wl 
+    prop_dict['substrate_in_weights'] = bool(substrate)
 
     if 'bar_offset' in stpsf_instrument.options.keys():
         prop_dict['bar_offset'] = stpsf_instrument.options['bar_offset'] 

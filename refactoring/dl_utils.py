@@ -324,6 +324,40 @@ def load_model_data(data_dir):
     return aperture, lyot, fpm, nircam_opd, wlens_weights, sampledWFEs
 
 
+COM_SUBSTRATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'coron_substrate',
+                                  'jwst_nircam_moda_com_substrate_trans.fits')
+
+
+def apply_substrate_transmission(wlen_weights, path=COM_SUBSTRATE_FILE):
+    """Band weights multiplied by the transmission of the coronagraph mask substrate.
+
+    Parameters
+    ----------
+    wlen_weights : array_like
+        Wavelengths [m] and their weights, shape (2, n_wl); the wavelengths are the
+        centres of equal bins, as STPSF makes them.
+    path : str, optional
+        Intensity transmission table of the substrate (WAVELENGTH [um], THROUGHPUT).
+
+    Returns
+    -------
+    numpy.ndarray
+        Wavelengths and weights, shape (2, n_wl); the weights keep their sum.
+
+    Notes
+    -----
+    The transmission is averaged over each wavelength bin. STPSF's filter throughputs
+    are imaging-mode curves, without the substrate the light crosses at the mask.
+    """
+    wavelengths, weights = np.asarray(wlen_weights, dtype=np.float64)
+    table = fits.getdata(path, 1)
+    width = np.diff(wavelengths).mean() if len(wavelengths) > 1 else 0.
+    samples = wavelengths[:, None] + width * ((np.arange(64) + 0.5) / 64 - 0.5)[None]
+    transmission = np.interp(samples * 1e6, table['WAVELENGTH'], table['THROUGHPUT']).mean(1)
+    weighted = weights * transmission
+    return np.array([wavelengths, weighted * weights.sum() / weighted.sum()])
+
+
 def generate_flux_rel_5sigma_fundamental_noise(fakes,noise_map,nsigma, mask_name='MASK335R', pixelscale=0.062, smooth_sigma_px=0.,annulus_size=4):
     """
     Compute what the flux of the planet should be, assuming we want it to be N times the 5 sigma fundamental noise limit at its separation.
