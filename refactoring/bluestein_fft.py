@@ -30,9 +30,9 @@ def bluestein_fft(field, n_out, n_fft, inverse=False, centre_in=(0., 0.), centre
     Parameters
     ----------
     field : torch.Tensor
-        Complex input field, shape (..., n_in, n_in).
-    n_out : int
-        Number of output samples in each dimension.
+        Complex input field, shape (..., n_in_y, n_in_x).
+    n_out : int or tuple of int
+        Number of output samples, in each dimension or as (n_y, n_x).
     n_fft : float or torch.Tensor
         Equivalent zero-padded length of the input signal. May be noninteger;
         a negative value reverses the transform sign. Must be nonzero.
@@ -45,7 +45,7 @@ def bluestein_fft(field, n_out, n_fft, inverse=False, centre_in=(0., 0.), centre
     Returns
     -------
     torch.Tensor
-        Unnormalized Fourier transform, shape (..., n_out, n_out).
+        Unnormalized Fourier transform, shape (..., n_y, n_x).
 
     Notes
     -----
@@ -53,31 +53,31 @@ def bluestein_fft(field, n_out, n_fft, inverse=False, centre_in=(0., 0.), centre
     zero-padded array is not allocated. Chirps are cached for fixed sampling
     and recalculated when gradients through the sampling are required.
     """
-    n_in = field.shape[-1]
+    n_in = tuple(field.shape[-2:])
+    n_out = (n_out, n_out) if isinstance(n_out, int) else tuple(n_out)
     scale = (-1 if inverse else 1) / n_fft
     # A shifted window is a linear phase on the other grid.
     if any(centre_out):
         field = field * _linear_phase(n_in, centre_out, scale, field)
     n_fft = n_fft if inverse else -n_fft
     if torch.is_tensor(n_fft) and n_fft.requires_grad:
-        chirp_in, chirp_out, h_fft = _chirps(n_in, n_out, n_fft, field.device, field.dtype)
+        (in_y, out_y, h_y), (in_x, out_x, h_x) = [_chirps(i, o, n_fft, field.device, field.dtype) for i, o in zip(n_in, n_out)]
     else:
-        chirp_in, chirp_out, h_fft = _fixed_chirps(n_in, n_out, float(n_fft), field.device, field.dtype)
-    size = h_fft.numel()
-    input_field = field * chirp_in[:, None] * chirp_in[None, :]
-    field_fft = torch.fft.fft2(input_field, s=(size, size))
-    convolution = torch.fft.ifft2(field_fft * h_fft[:, None] * h_fft[None, :])
-    result = convolution[..., n_in - 1:n_in - 1 + n_out, n_in - 1:n_in - 1 + n_out]
-    result = result * chirp_out[:, None] * chirp_out[None, :]
+        (in_y, out_y, h_y), (in_x, out_x, h_x) = [_fixed_chirps(i, o, float(n_fft), field.device, field.dtype)
+                                                  for i, o in zip(n_in, n_out)]
+    field_fft = torch.fft.fft2(field * in_y[:, None] * in_x[None, :], s=(h_y.numel(), h_x.numel()))
+    convolution = torch.fft.ifft2(field_fft * h_y[:, None] * h_x[None, :])
+    result = convolution[..., n_in[0] - 1:n_in[0] - 1 + n_out[0], n_in[1] - 1:n_in[1] - 1 + n_out[1]]
+    result = result * out_y[:, None] * out_x[None, :]
     if any(centre_in):
         result = result * _linear_phase(n_out, centre_in, scale, field, centre_out)
     return result
 
 
-def _linear_phase(n, slope, scale, like, origin=(0., 0.)):
-    """exp(2 pi i scale (slope_y (y + origin_y) + slope_x (x + origin_x))) on a centred n x n grid."""
-    axis = torch.arange(n, device=like.device, dtype=torch.float64) - (n - 1) / 2
-    phase = slope[0] * (axis[:, None] + origin[0]) + slope[1] * (axis[None, :] + origin[1])
+def _linear_phase(shape, slope, scale, like, origin=(0., 0.)):
+    """exp(2 pi i scale (slope_y (y + origin_y) + slope_x (x + origin_x))) on a centred grid of the given shape."""
+    y, x = [torch.arange(n, device=like.device, dtype=torch.float64) - (n - 1) / 2 for n in shape]
+    phase = slope[0] * (y[:, None] + origin[0]) + slope[1] * (x[None, :] + origin[1])
     return torch.exp(2j * torch.pi * scale * phase).to(like.dtype)
 
 

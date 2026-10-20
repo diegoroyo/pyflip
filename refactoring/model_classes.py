@@ -4,6 +4,11 @@ import torch
 import numpy as np 
 import math 
 
+if __package__:
+    from .dl_utils import centred_axis
+else:
+    from dl_utils import centred_axis
+
 class ShiftModule(nn.Module):
     """Shift, rotation and magnification of a mask about the grid centre, by bilinear resampling.
 
@@ -22,10 +27,8 @@ class ShiftModule(nn.Module):
         self.y_shift = nn.Parameter(torch.zeros(1, dtype=torch.float64), requires_grad=True)
         self.rotation = nn.Parameter(torch.zeros(1, dtype=torch.float64), requires_grad=True)
         self.scale = nn.Parameter(torch.ones(1, dtype=torch.float64), requires_grad=learn_scale)
-        y = torch.arange(height, dtype=torch.float64) - (height - 1) / 2
-        x = torch.arange(width, dtype=torch.float64) - (width - 1) / 2
-        self.register_buffer('y', y[:, None].expand(height, width).clone())
-        self.register_buffer('x', x[None, :].expand(height, width).clone())
+        self.register_buffer('y', centred_axis(height)[:, None])
+        self.register_buffer('x', centred_axis(width)[None, :])
         if device is not None:
             self.to(device)
 

@@ -39,7 +39,7 @@ from dl_utils import arcsec2rad,calc_snr, circular_mask, merge_injected_planets,
 from model_classes import PerMirrorZernikes, OPDOffsetModule, LinearInterpOPD,PTT_OPD,ZernikeBasis,ZernikeModel
 
 from propagation_classes import Wavefront,BroadbandWavefront,PointPropagate
-from refactoring.optical_elements import BabinetImageOptic, flip_mask_regions, load_raster_region
+from refactoring.optical_elements import make_occulter
 
 
 if __name__ == "__main__":
@@ -136,10 +136,8 @@ if __name__ == "__main__":
     lyot = torch.FloatTensor(lyot).to(DEVICE)[None]
     occulter = None
     if args.occulter == 'babinet':
-        regions = flip_mask_regions(fpm, spot=args.fpm_raster is None, mount=not args.no_mount)
-        if args.fpm_raster is not None:
-            regions.append(load_raster_region(args.fpm_raster, args.um_per_arcsec, wlen_weights[0], diameter / wf_npix))
-        occulter = BabinetImageOptic(regions).to(DEVICE)
+        occulter = make_occulter(fpm, wlen_weights[0], diameter / wf_npix, mount=not args.no_mount,
+                                 fpm_raster=args.fpm_raster, um_per_arcsec=args.um_per_arcsec).to(DEVICE)
     elif args.no_mount or args.fpm_raster is not None:
         raise ValueError('--no_mount and --fpm_raster need --occulter babinet')
     geometry['occulter'] = occulter
@@ -475,6 +473,8 @@ if __name__ == "__main__":
     lyot_shifts = prop_models[0].lyot_shifts
     for p_model in prop_models[1:]:
         p_model.lyot_shifts = lyot_shifts
+        if p_model.lyot_optic is not None:
+            p_model.lyot_optic.pupil_shifts = lyot_shifts
     lyot_params = [lyot_shifts.x_shift, lyot_shifts.y_shift, lyot_shifts.rotation]
     for t in lyot_params:
         t.requires_grad_(False)

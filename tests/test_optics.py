@@ -444,6 +444,17 @@ def test_bluestein_off_axis_windows_against_direct_sum(inverse, n_in, n_out, per
     torch.testing.assert_close(actual, direct, rtol=1e-12, atol=1e-12)
 
 
+def test_bluestein_rectangular_windows_against_direct_sum():
+    """Rectangular input and output windows, centred off the origin."""
+    field = asymmetric_field(9)[:, :7]
+    centre_in, centre_out, period = (0.5, -1.), (1.5, -2.), 13.
+    y, x = [torch.arange(n, dtype=torch.float64) - (n - 1)/2 + c for n, c in zip(field.shape, centre_in)]
+    v, u = [torch.arange(n, dtype=torch.float64) - (n - 1)/2 + c for n, c in zip((5, 8), centre_out)]
+    direct = torch.exp(2j * torch.pi * v[:, None] * y[None, :] / period) @ field @ torch.exp(2j * torch.pi * u[:, None] * x[None, :] / period).T
+    actual = bluestein_fft(field, (5, 8), period, centre_in=centre_in, centre_out=centre_out)
+    torch.testing.assert_close(actual, direct, rtol=1e-12, atol=1e-12)
+
+
 def occulter_mask(n_focal, n_wl=2):
     """Transmission on PyFLIP's focal grid: a smooth spot on the axis, an off-axis
     gray square and an opaque band across the whole grid, shape (n_wl, n_focal, n_focal)."""

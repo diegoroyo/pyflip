@@ -480,6 +480,10 @@ def calc_nfringes(
 
 
 
+def centred_axis(n, d=1., device=None):
+    """Sample coordinates of a centred axis, (j - (n - 1)/2) * d, in float64, shape (n,)."""
+    return (torch.arange(n, device=device, dtype=torch.float64) - (n - 1) / 2) * d
+
 def nd_coords(npixels, pixel_scales = 1.0, offsets=0.0, indexing: str = "xy",):
 
     if not isinstance(npixels, tuple):
@@ -490,8 +494,7 @@ def nd_coords(npixels, pixel_scales = 1.0, offsets=0.0, indexing: str = "xy",):
         offsets = (offsets,) * len(npixels)
 
     def pixel_fn(n, offset, scale):
-        pix = torch.arange(n) - (n - 1) / 2.0
-        pix *= scale
+        pix = centred_axis(n, scale)
         pix -= offset
         return pix
 

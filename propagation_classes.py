@@ -5,7 +5,7 @@ import numpy as np
 import math 
 from dl_utils import pixel_coords, crop_to, partial_MFT,shift_image_subpixel
 from model_classes import ShiftModule, GridOffsetModule,FlatFieldingModule,PerMirrorZernikes, OPDOffsetModule, FluxOffsetModule,AngleOffsetModule,LinearInterpOPD,PTT_OPD,LearnableGaussianBlur
-from refactoring.optical_elements import DiffImageOptic, DiffLyotOptic, BabinetImageOptic
+from refactoring.optical_elements import DiffImageOptic, DiffLyotOptic
 
 
 
@@ -235,7 +235,8 @@ class PointPropagate(nn.Module):
             self.lyot_optic.axial_offset = lyot_axial_offset
 
         self.lyot_shifts = ShiftModule(lyot.shape[-2], lyot.shape[-1])
-        self.fpm_shifts = ShiftModule(fpm.shape[-2], fpm.shape[-1])
+        if self.lyot_optic is not None:
+            self.lyot_optic.pupil_shifts = self.lyot_shifts
         
         self.nircam_offsets = GridOffsetModule(nircam_opd.shape[-2], nircam_opd.shape[-1])
 
@@ -278,11 +279,9 @@ class PointPropagate(nn.Module):
         returned = self.fpm_optic(phasors, wavefront.npixels, self.oversample,
                                   wavelengths=wavefront.wavelengths, d_pupil=wavefront.pixel_scale,
                                   crop_output=not full_pupil)
-        transmission = self.lyot_shifts(self.lyot)
         if full_pupil:
-            self.lyot_optic.amplitude = transmission
             return self.lyot_optic.displaced_stop(returned, wavefront.wavelengths, wavefront.pixel_scale)
-        return wavefront.forward(returned, transmission)
+        return wavefront.forward(returned, self.lyot_shifts(self.lyot))
 
     # making changes here
     def forward(self, broadbandwavefront, wfe,wavelengths, wl_weights):

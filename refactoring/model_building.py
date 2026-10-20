@@ -3,8 +3,7 @@ from dl_utils import load_model_data,arcsec2rad
 import numpy as np 
 import torch.nn.functional as F
 import torch.nn as nn
-from optical_elements import (DiffPupilOptic, DiffLyotOptic, DiffImageOptic, DiffDetector, DiffOpticalSystem,
-                              BabinetImageOptic, flip_mask_regions, load_raster_region)
+from optical_elements import DiffPupilOptic, DiffLyotOptic, DiffImageOptic, DiffDetector, DiffOpticalSystem, make_occulter
 from model_classes import OPDOffsetModule
 import astropy.units as u 
 import os 
@@ -246,13 +245,8 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
 
     nircam_OPD = torch.tensor(nircam_OPD, dtype=torch.float64).to(DEVICE)[None]
     lyot = torch.FloatTensor(lyot).to(DEVICE)[None]
-    if babinet:
-        regions = flip_mask_regions(fpm, spot=fpm_raster is None, mount=mount)
-        if fpm_raster is not None:
-            regions.append(load_raster_region(fpm_raster, um_per_arcsec, wlen_weights[0], diameter / wf_npix))
-    elif fpm_raster is not None or not mount:
+    if not babinet and (fpm_raster is not None or not mount):
         raise ValueError('fpm_raster and mount=False need babinet=True')
-    fpm = torch.FloatTensor(fpm).to(DEVICE)[None]
     wlen_weights = torch.as_tensor(wlen_weights, dtype=torch.float64, device=DEVICE)
 
     sampledWFEs = torch.from_numpy(sampledWFEs.copy()).float()
@@ -279,10 +273,11 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
     JWST_primary = DiffPupilOptic(name='JWSTPrimary',opd=entrance_OPD, amplitude=aperture,
                                 wfe_offsets=OPDOffsetModule(wf_npix, wf_npix, device=DEVICE))
     if babinet:
-        NIRCam_FPM = BabinetImageOptic(regions, name='NIRCam coron focal plane mask',
-                                       axial_offset=fpm_axial_offset, focal_length=fpm_focal_length).to(DEVICE)
+        NIRCam_FPM = make_occulter(fpm, wlen_weights[0].cpu(), diameter / wf_npix, mount=mount, fpm_raster=fpm_raster,
+                                   um_per_arcsec=um_per_arcsec, name='NIRCam coron focal plane mask',
+                                   axial_offset=fpm_axial_offset, focal_length=fpm_focal_length).to(DEVICE)
     else:
-        NIRCam_FPM = DiffImageOptic(name='NIRCam coron focal plane mask',amplitude=fpm,
+        NIRCam_FPM = DiffImageOptic(name='NIRCam coron focal plane mask',amplitude=torch.FloatTensor(fpm).to(DEVICE)[None],
                                   axial_offset=fpm_axial_offset, focal_length=fpm_focal_length)
     NIRCam_Lyot = DiffLyotOptic(name='NIRCamLyotstop',opd=nircam_OPD, amplitude=lyot,
                               axial_offset=lyot_axial_offset,

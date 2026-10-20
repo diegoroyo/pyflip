@@ -5,12 +5,12 @@ import sys
 from scipy import ndimage
 if __package__:
     from .model_classes import OPDOffsetModule, LearnableGaussianBlur, FlatFieldingModule, DetSubPixShift, ShiftModule
-    from .dl_utils import crop_to, partial_MFT, shift_image_subpixel
+    from .dl_utils import crop_to, partial_MFT, shift_image_subpixel, centred_axis
     from .diffraction import FresnelTransfer, propagate_wavelengths
     from .bluestein_fft import bluestein_fft
 else:
     from model_classes import OPDOffsetModule, LearnableGaussianBlur, FlatFieldingModule, DetSubPixShift, ShiftModule
-    from dl_utils import crop_to, partial_MFT, shift_image_subpixel
+    from dl_utils import crop_to, partial_MFT, shift_image_subpixel, centred_axis
     from diffraction import FresnelTransfer, propagate_wavelengths
     from bluestein_fft import bluestein_fft
 
@@ -240,7 +240,7 @@ class BlockedRegion(nn.Module):
     Attributes
     ----------
     blocked : torch.Tensor
-        Blocked amplitude, shape (n_wl or 1, n, n).
+        Blocked amplitude, shape (n_wl or 1, n_y, n_x).
     centre : tuple of float
         Window centre (y, x) relative to the optical axis [focal samples].
     n_fft : torch.Tensor
@@ -267,14 +267,14 @@ class BlockedRegion(nn.Module):
         torch.Tensor
             Blocked field at the second pupil, shape (..., n_wl, n_out, n_out).
         """
-        if self.n_fft.numel() == 1:
+        if len(self.n_fft) == 1:
             return self._propagate(field, self.blocked, float(self.n_fft), n_out)
-        return torch.stack([self._propagate(field[..., i, :, :], self.blocked[min(i, len(self.blocked) - 1)],
-                                            float(n_fft), n_out)
+        blocked = self.blocked.expand(len(self.n_fft), -1, -1)
+        return torch.stack([self._propagate(field[..., i, :, :], blocked[i], float(n_fft), n_out)
                             for i, n_fft in enumerate(self.n_fft)], dim=-3)
 
     def _propagate(self, field, blocked, n_fft, n_out):
-        focal = bluestein_fft(field, blocked.shape[-1], n_fft, centre_out=self.centre) / n_fft**2
+        focal = bluestein_fft(field, tuple(blocked.shape[-2:]), n_fft, centre_out=self.centre) / n_fft**2
         return bluestein_fft(focal * blocked.to(field.dtype), n_out, n_fft, inverse=True, centre_in=self.centre)
 
 
@@ -347,17 +347,10 @@ class BabinetImageOptic(DiffOpticalElement):
 
     def defocus(self, n, wavelengths, d_pupil):
         """Pupil phase of the mask displacement, shape (n_wl, n, n)."""
-        axis = (torch.arange(n, device=self.axial_offset.device, dtype=torch.float64) - (n - 1) / 2) * d_pupil
+        axis = centred_axis(n, d_pupil, self.axial_offset.device)
         radius2 = axis[:, None].square() + axis[None, :].square()
         wavelengths = wavelengths.to(device=axis.device, dtype=torch.float64)[:, None, None]
         return torch.exp(-1j * torch.pi * self.axial_offset * radius2 / (wavelengths * self.focal_length**2))
-
-
-def square_window(array, start):
-    """Zero-pad the last two axes to a square; returns it and its centre (y, x) [samples]."""
-    n = max(array.shape[-2:])
-    array = np.pad(array, [(0, 0)] * (array.ndim - 2) + [(0, n - array.shape[-2]), (0, n - array.shape[-1])])
-    return array, (start[0] + (n - 1) / 2, start[1] + (n - 1) / 2)
 
 
 def flip_mask_regions(fpm, spot=True, mount=True):
@@ -387,8 +380,8 @@ def flip_mask_regions(fpm, spot=True, mount=True):
     for k, (ys, xs) in enumerate(ndimage.find_objects(labels), start=1):
         on_axis = ys.start <= axis < ys.stop and xs.start <= axis < xs.stop
         if spot if on_axis else mount:
-            window, centre = square_window(np.where(labels[ys, xs] == k, rest[:, ys, xs], 0.), (ys.start, xs.start))
-            regions.append(BlockedRegion(window, (centre[0] - axis, centre[1] - axis), M))
+            centre = ((ys.start + ys.stop - 1) / 2 - axis, (xs.start + xs.stop - 1) / 2 - axis)
+            regions.append(BlockedRegion(np.where(labels[ys, xs] == k, rest[:, ys, xs], 0.), centre, M))
     return regions
 
 
@@ -412,9 +405,9 @@ def raster_region(opaque, d_focal, axis, wavelengths, d_pupil):
     -------
     BlockedRegion
     """
-    window, centre = square_window(np.asarray(opaque, dtype=np.float64)[None], (0, 0))
+    n_y, n_x = np.shape(opaque)
     n_fft = np.asarray(wavelengths, dtype=np.float64) / (float(d_pupil) * d_focal)
-    return BlockedRegion(window, (centre[0] - axis[0], centre[1] - axis[1]), n_fft)
+    return BlockedRegion(np.asarray(opaque, dtype=np.float64)[None], ((n_y - 1) / 2 - axis[0], (n_x - 1) / 2 - axis[1]), n_fft)
 
 
 def load_raster_region(path, um_per_arcsec, wavelengths, d_pupil):
@@ -442,6 +435,36 @@ def load_raster_region(path, um_per_arcsec, wavelengths, d_pupil):
     axis = ((raster['centroid_um'][1] - raster['y0_um']) / d_um - 0.5,
             (raster['centroid_um'][0] - raster['x0_um']) / d_um - 0.5)
     return raster_region(raster['opaque'], d_um / um_per_arcsec * np.pi / (180 * 3600), axis, wavelengths, d_pupil)
+
+
+def make_occulter(fpm, wavelengths, d_pupil, mount=True, fpm_raster=None, um_per_arcsec=593.336, **kwargs):
+    """BabinetImageOptic from PyFLIP's mask files, with the spot optionally replaced by a mask raster.
+
+    Parameters
+    ----------
+    fpm : array_like
+        Amplitude transmission on PyFLIP's focal grid, shape (n_wl, M, M).
+    wavelengths : array_like
+        Wavelengths of the light [m], shape (n_wl,).
+    d_pupil : float
+        Spatial sampling interval of the pupil field [m].
+    mount : bool, optional
+        Keep the mask's mount regions.
+    fpm_raster : str, optional
+        Mask raster file replacing the spot (see load_raster_region).
+    um_per_arcsec : float, optional
+        Mask scale on the sky for the raster [um/arcsec].
+    **kwargs
+        Passed to BabinetImageOptic.
+
+    Returns
+    -------
+    BabinetImageOptic
+    """
+    regions = flip_mask_regions(fpm, spot=fpm_raster is None, mount=mount)
+    if fpm_raster is not None:
+        regions.append(load_raster_region(fpm_raster, um_per_arcsec, wavelengths, d_pupil))
+    return BabinetImageOptic(regions, **kwargs)
 
 
 class DiffDetector(DiffOpticalElement):
