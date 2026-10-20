@@ -4,6 +4,7 @@ from pyklip.klip import nan_gaussian_filter
 import os.path
 from pyklip.klip import meas_contrast
 import json
+import astropy.io.fits as fits
 import torch.nn.functional as F
 from pyklip.fakes import gaussfit2d
 
@@ -107,7 +108,39 @@ def weighted_smooth_l1_loss(pred, obs, noise, beta=1.0, reduction='mean'):
     else:
         return weighted_loss
 
-def load_data(data_dir, num_wl=None, oversample=None):
+# NIRCam module A coronagraph mask substrate, measured by J. Krist (2015-10-28); see refactoring/data/coron_substrate/README.md.
+COM_SUBSTRATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'refactoring', 'data', 'coron_substrate',
+                                  'jwst_nircam_moda_com_substrate_trans.fits')
+
+
+def apply_substrate_transmission(wlen_weights, path=COM_SUBSTRATE_FILE):
+    """Band weights multiplied by the transmission of the coronagraph mask substrate.
+
+    Parameters
+    ----------
+    wlen_weights : array_like
+        Wavelengths [m] and their weights, shape (2, n_wl); the wavelengths are the
+        centres of equal bins, as STPSF makes them.
+    path : str, optional
+        Intensity transmission table of the substrate (WAVELENGTH [um], THROUGHPUT).
+
+    Returns
+    -------
+    numpy.ndarray
+        Wavelengths and weights, shape (2, n_wl); the weights keep their sum.
+    """
+    wavelengths, weights = np.asarray(wlen_weights, dtype=np.float64)
+    table = fits.getdata(path, 1)
+    width = np.diff(wavelengths).mean() if len(wavelengths) > 1 else 0.
+    samples = wavelengths[:, None] + width * ((np.arange(64) + 0.5) / 64 - 0.5)[None]
+    transmission = np.interp(samples * 1e6, table['WAVELENGTH'], table['THROUGHPUT']).mean(1)
+    weighted = weights * transmission
+    return np.array([wavelengths, weighted * weights.sum() / weighted.sum()])
+
+
+def load_data(data_dir, num_wl=None, oversample=None, substrate=True):
+    """MASK335R model files (module A); substrate=True weights the band by the mask
+    substrate's transmission (apply_substrate_transmission)."""
     basic_masks_dir = os.path.join(data_dir, 'masks_1024')
 
     aperture = np.load(f'{basic_masks_dir}/primary_transmission_1024.npy')
@@ -126,6 +159,8 @@ def load_data(data_dir, num_wl=None, oversample=None):
     # WAVELENGTH DEPENDENCE
 
     wlens_weights = np.load(os.path.join(data_dir, 'wlens_weights', 'lambda_weights.npy'))
+    if substrate:
+        wlens_weights = apply_substrate_transmission(wlens_weights)
     fpm, nircam_opd = [], []
     for i in range(len(wlens_weights[0])):
         currfpm = np.load(f'{data_dir}/mask335r_transmissions/mask335r_transmission_{i}.npy')

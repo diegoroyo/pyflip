@@ -205,6 +205,7 @@ def generate_STPSF_model_params(stpsf_instrument, spec_type='A1V', catalog_spec=
     prop_dict['pupil_rotation'] = stpsf_instrument.options['pupil_rotation']
     prop_dict['img_oversample'] = oversample
     prop_dict['num_wl'] = num_wl 
+    prop_dict['module'] = stpsf_instrument.module
     prop_dict['substrate_in_weights'] = bool(substrate)
 
     if 'bar_offset' in stpsf_instrument.options.keys():

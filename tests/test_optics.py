@@ -589,6 +589,25 @@ def test_substrate_transmission_reweights_band():
     np.testing.assert_allclose(apply_substrate_transmission([[4.4e-6], [1.]]), [[4.4e-6], [1.]])
 
 
+def test_load_model_data_applies_substrate_once(tmp_path):
+    """Loading weights the band by the substrate, unless the directory's config records it."""
+    import json
+    from dl_utils import load_model_data
+    weights = np.array([np.linspace(3.9e-6, 4.9e-6, 3), np.full(3, 1 / 3)])
+    for sub in ('pupil_masks', 'opds', 'wavelength_dependents/wlens_weights',
+                'wavelength_dependents/image_mask_transmissions', 'wavelength_dependents/fov_wl_nircam_opds'):
+        (tmp_path / sub).mkdir(parents=True)
+    for name in ('pupil_masks/primary_transmission.npy', 'pupil_masks/lyotstop_transmission.npy', 'opds/observation_opd.npy'):
+        np.save(tmp_path / name, np.ones((4, 4)))
+    np.save(tmp_path / 'wavelength_dependents/wlens_weights/lambda_weights.npy', weights)
+    for i in range(3):
+        np.save(tmp_path / ('wavelength_dependents/image_mask_transmissions/image_mask_transmission_%d.npy' % i), np.ones((8, 8)))
+        np.save(tmp_path / ('wavelength_dependents/fov_wl_nircam_opds/fov_wl_nircam_opd_%d.npy' % i), np.zeros((4, 4)))
+    for recorded, expected in ((False, apply_substrate_transmission(weights)), (True, weights)):
+        json.dump({'image_mask': 'MASK335R', 'module': 'A', 'substrate_in_weights': recorded}, open(tmp_path / 'instrument_config.json', 'w'))
+        np.testing.assert_allclose(load_model_data(str(tmp_path))[4], expected)
+
+
 def test_shift_module_identity_and_integer_shift():
     mask = asymmetric_field(12).abs()[None]
     shift = ShiftModule(12, 12)
