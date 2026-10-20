@@ -1,8 +1,11 @@
 """testing.py with the Babinet occulter, the FPM axial offset and the Lyot stop
 shift and rotation fitted on the reference star. Paths and options below, or from
-the environment variables named there.
+the environment variables named there. Run from anywhere; the modules come from
+refactoring/.
 """
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'refactoring'))
 import numpy as np
 import torch
 import torch.nn as nn
