@@ -3,7 +3,8 @@ from dl_utils import load_model_data,arcsec2rad
 import numpy as np 
 import torch.nn.functional as F
 import torch.nn as nn
-from optical_elements import DiffPupilOptic, DiffLyotOptic, DiffImageOptic, DiffDetector, DiffOpticalSystem
+from optical_elements import (DiffPupilOptic, DiffLyotOptic, DiffImageOptic, DiffDetector, DiffOpticalSystem,
+                              BabinetImageOptic, flip_mask_regions, load_raster_region)
 from model_classes import OPDOffsetModule
 import astropy.units as u 
 import os 
@@ -212,8 +213,13 @@ def generate_STPSF_model_params(stpsf_instrument, spec_type='A1V', catalog_spec=
         return None
 
 def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,diameter = 6.603464, DEVICE='cuda',
-                               oversample=2, wf_npix=1024, fpm_axial_offset=None, fpm_focal_length=None, lyot_axial_offset=None):
+                               oversample=2, wf_npix=1024, fpm_axial_offset=None, fpm_focal_length=None, lyot_axial_offset=None,
+                               babinet=False, mount=True, fpm_raster=None, um_per_arcsec=593.336):
     """
+    babinet=True applies the focal plane mask through Babinet's principle; mount=False
+    drops its mount regions, and fpm_raster replaces the spot by a mask raster file at
+    um_per_arcsec [um/arcsec].
+
     Set fpm_axial_offset [m] and fpm_focal_length [m] to include an axially
     displaced focal plane mask. Both distances refer to the equivalent optical
     system with the telescope entrance pupil, rather than mechanical distances
@@ -240,6 +246,12 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
 
     nircam_OPD = torch.tensor(nircam_OPD, dtype=torch.float64).to(DEVICE)[None]
     lyot = torch.FloatTensor(lyot).to(DEVICE)[None]
+    if babinet:
+        regions = flip_mask_regions(fpm, spot=fpm_raster is None, mount=mount)
+        if fpm_raster is not None:
+            regions.append(load_raster_region(fpm_raster, um_per_arcsec, wlen_weights[0], diameter / wf_npix))
+    elif fpm_raster is not None or not mount:
+        raise ValueError('fpm_raster and mount=False need babinet=True')
     fpm = torch.FloatTensor(fpm).to(DEVICE)[None]
     wlen_weights = torch.as_tensor(wlen_weights, dtype=torch.float64, device=DEVICE)
 
@@ -266,8 +278,12 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
 
     JWST_primary = DiffPupilOptic(name='JWSTPrimary',opd=entrance_OPD, amplitude=aperture,
                                 wfe_offsets=OPDOffsetModule(wf_npix, wf_npix, device=DEVICE))
-    NIRCam_FPM = DiffImageOptic(name='NIRCam coron focal plane mask',amplitude=fpm,
-                              axial_offset=fpm_axial_offset, focal_length=fpm_focal_length)
+    if babinet:
+        NIRCam_FPM = BabinetImageOptic(regions, name='NIRCam coron focal plane mask',
+                                       axial_offset=fpm_axial_offset, focal_length=fpm_focal_length).to(DEVICE)
+    else:
+        NIRCam_FPM = DiffImageOptic(name='NIRCam coron focal plane mask',amplitude=fpm,
+                                  axial_offset=fpm_axial_offset, focal_length=fpm_focal_length)
     NIRCam_Lyot = DiffLyotOptic(name='NIRCamLyotstop',opd=nircam_OPD, amplitude=lyot,
                               axial_offset=lyot_axial_offset,
                               wfe_offsets=OPDOffsetModule(wf_npix, wf_npix, device=DEVICE))

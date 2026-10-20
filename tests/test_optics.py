@@ -583,3 +583,69 @@ def test_shift_module_rotation_direction_and_gradient():
             parameter += 1e-6
         assert abs(derivative) > 1e-4
         torch.testing.assert_close(derivative[0], (plus - minus) / 2e-6, rtol=1e-6, atol=1e-9)
+
+
+def small_system(fpm, lyot_amplitude, n=16, fpm_offset=None):
+    """Primary, focal plane mask, Lyot stop and detector named as in assemble_JWST_NIRCam_coron."""
+    from wavefronts import BroadbandWavefront
+    d_x, wavelength = 1e-5, 1e-6
+    wavelengths = torch.tensor([wavelength], dtype=torch.float64)
+    field = asymmetric_field(n)
+    primary = DiffPupilOptic(name='JWSTPrimary', opd=field.angle()[None] * wavelength / (2 * torch.pi),
+                            amplitude=field.abs()[None], wfe_offsets=torch.nn.Identity())
+    lyot = DiffLyotOptic(name='NIRCamLyotstop', opd=torch.zeros(1, 1, n, n), amplitude=lyot_amplitude,
+                        wfe_offsets=torch.nn.Identity())
+    args = (n, wavelengths, d_x, n, wavelength / (n*d_x), None, [0., 0.], True, False)
+    detector = DiffDetector(args, oversample=2, num_det_px=n, name='NIRCamdetector', device='cpu')
+    system = DiffOpticalSystem(optical_element_list=[primary, fpm, lyot, detector])
+    wavefront = BroadbandWavefront(n, n*d_x, [[wavelength], [1.]], torch.ones(1, dtype=torch.float64), DEVICE='cpu')
+    return system, wavefront
+
+
+def test_system_with_babinet_occulter_matches_fft_chain():
+    mask = occulter_mask(32, 1)
+    stop = asymmetric_field(16).abs()[None]
+    expected, wavefront = small_system(DiffImageOptic(amplitude=mask[None]), stop)
+    actual, _ = small_system(BabinetImageOptic(flip_mask_regions(mask)), stop)
+    torch.testing.assert_close(actual(wavefront), expected(wavefront), rtol=1e-10, atol=1e-12)
+
+
+def test_lyot_stop_shift_in_system():
+    """Zero shift applies the stop (and primary) as stored; an integer shift equals the rolled stop."""
+    mask = occulter_mask(32, 1)
+    stop = torch.nn.functional.pad(asymmetric_field(12).abs(), (2, 2, 2, 2))[None]
+    system, wavefront = small_system(DiffImageOptic(amplitude=mask[None]), stop)
+    with torch.no_grad():
+        nominal = system(wavefront)
+        for element in (system.optical_system.NIRCamLyotstop, system.optical_system.JWSTPrimary):
+            torch.testing.assert_close(element.transmission(), element.amplitude, rtol=0, atol=1e-15)
+        system.optical_system.NIRCamLyotstop.pupil_shifts.x_shift.fill_(1.)
+        shifted = system(wavefront)
+    rolled, _ = small_system(DiffImageOptic(amplitude=mask[None]), torch.roll(stop, 1, -1))
+    torch.testing.assert_close(shifted, rolled(wavefront), rtol=1e-10, atol=1e-12)
+    assert torch.linalg.vector_norm(shifted - nominal) > 1e-3 * torch.linalg.vector_norm(nominal)
+
+
+def test_stages_fit_geometry_on_reference_only():
+    from optimization_handlers import default_stages, geometry_parameters
+    mask = occulter_mask(32, 1)
+    fpm = BabinetImageOptic(flip_mask_regions(mask), axial_offset=1e-6, focal_length=1e-3)
+    system, wavefront = small_system(fpm, asymmetric_field(16).abs()[None])
+    from model_classes import OPDOffsetModule
+    elements = system.optical_system
+    elements.JWSTPrimary.wfe_offsets = OPDOffsetModule(16, 16, device='cpu')
+    elements.NIRCamLyotstop.wfe_offsets = OPDOffsetModule(16, 16, device='cpu')
+    others = [elements.JWSTPrimary.wfe_offsets.grid, elements.NIRCamLyotstop.wfe_offsets.grid,
+              elements.NIRCamdetector.detector_flat_field.grid]
+    parameters = geometry_parameters(system)
+    assert len(parameters) == 4
+    for stage, expected in [(100, 0.), (1000, 1.), (4000, 1.), (5800, 0.), (8000, 0.)]:
+        for parameter in parameters:
+            parameter.grad = torch.ones_like(parameter)
+        for parameter in others + [wavefront.angles_offset]:
+            parameter.grad = torch.ones_like(parameter)
+        default_stages(system, wavefront, stage)
+        if expected:
+            assert all(float(parameter.grad.abs().max()) == expected for parameter in parameters)
+        else:
+            assert all(parameter.grad is None for parameter in parameters)
