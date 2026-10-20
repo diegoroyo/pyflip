@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from wavefronts import BroadbandWavefront
 from model_building import assemble_JWST_NIRCam_coron
-from dl_utils import load_model_data, load_and_crop_data
+from dl_utils import load_model_data, load_and_crop_data, arcsec2rad
 
 #### OPTIONS
 frames = [tuple(f.split(':')) for f in os.environ['FRAMES'].split(',')]
@@ -31,7 +31,8 @@ fpm_raster = os.environ.get('FPM_RASTER')                    # real mask raster 
 lyot_file = os.environ['LYOT_FILE']                          # stpsf's MASKRND transmission, 1024 x 1024
 out_dir = os.environ.get('OUT_DIR', 'science_chi2')
 cases = os.environ.get('CASES', 'real593_bl_sq,real637_bl_sq').split(',')
-iters = int(os.environ.get('ITERS', 300))
+steps = int(os.environ.get('STEPS', 6))                      # Gauss-Newton steps of the star fit
+star_step = arcsec2rad(5e-4)                                 # finite-difference step [rad]
 substrate = os.environ.get('SUBSTRATE', '1') == '1'           # band weights x the mask substrate's transmission
 fpm_focal_length = 131.4                                     # equivalent focal length [m]
 um_per_arcsec = {'593': 593.336, '637': 637.045}
@@ -103,20 +104,26 @@ def chi2(PSF, frame):
 
 
 def fit_star(wavefront, instrument, frame):
-    """Star position by Adam with a cosine schedule; final chi^2/N and the model image at the fitted flux."""
-    wavefront.angles_offset.requires_grad_(True)
-    optimizer = torch.optim.Adam([wavefront.angles_offset], lr=4e-9)                     # [rad]
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iters, eta_min=0.)
-    for i in range(iters):
-        optimizer.zero_grad()
-        chi2(instrument(wavefront), frame).backward()
-        optimizer.step()
-        scheduler.step()
-    with torch.no_grad():
-        PSF = instrument(wavefront)
-        ref, weights, _ = frame
-        flux = (weights * PSF * ref).sum() / (weights * PSF**2).sum()
-        return chi2(PSF, frame).item(), np.squeeze((flux * PSF).cpu().numpy())
+    """Star position by Gauss-Newton with forward-difference derivatives, flux in closed form
+    in every residual; final chi^2/N and the model image at the fitted flux."""
+    ref, weights, n_px = frame
+    root_weights = weights.sqrt()
+
+    def residual(star):
+        with torch.no_grad():
+            wavefront.angles_offset.copy_(star)
+            PSF = instrument(wavefront)
+        image = PSF * (weights * PSF * ref).sum() / (weights * PSF**2).sum()
+        return (root_weights * (image - ref)).reshape(-1), image
+
+    star = torch.zeros(2, dtype=torch.float64, device=DEVICE)
+    for i in range(steps):
+        r, _ = residual(star)
+        jacobian = torch.stack([(residual(star + star_step * e)[0] - r) / star_step
+                                for e in torch.eye(2, dtype=torch.float64, device=DEVICE)], dim=1)
+        star = star + torch.linalg.lstsq(jacobian, -r[:, None]).solution[:, 0]
+    r, image = residual(star)
+    return (r @ r).item() / n_px, np.squeeze(image.cpu().numpy())
 
 
 results, models = {}, {}
