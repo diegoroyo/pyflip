@@ -1,7 +1,7 @@
 """testing.py with the Babinet occulter, the FPM axial offset and the Lyot stop
 shift and rotation fitted on the reference star. Paths and options below, or from
-the environment variables named there. Run from anywhere; the modules come from
-refactoring/.
+the environment variables named there. Run from refactoring/: the modules come from
+there, and inject_fake_planets reads data/ relative to the working directory.
 """
 import os
 import sys
