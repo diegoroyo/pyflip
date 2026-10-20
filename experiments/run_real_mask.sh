@@ -1,5 +1,6 @@
 # Fit with the real mask raster at 593.336 and 637.045 um/arcsec and a fitted FPM axial offset.
-# The mount is dropped unless MOUNT=1. Usage: FPM_RASTER=/path/to/raster.npz bash run_real_mask.sh
+# The mount is dropped unless MOUNT=1. Usage: FPM_RASTER=/path/to/raster.npz bash experiments/run_real_mask.sh
+cd "$(dirname "$0")/.."
 : "${FPM_RASTER:?set FPM_RASTER to the mask raster .npz}"
 MOUNT_FLAG=--no_mount
 if [ "${MOUNT:-0}" = 1 ]; then MOUNT_FLAG=; fi
