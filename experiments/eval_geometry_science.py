@@ -1,16 +1,17 @@
-"""Science frames scored with the instrument geometry held fixed: either PyFLIP's defaults
-or the values fit_geometry_cases.py fitted on the reference star. Only the star position
+"""Science frames scored with the instrument geometry held fixed: either PyFLIP as
+shipped or the values fit_geometry_cases.py fitted on the reference star. Only the star position
 and flux are fitted per frame; no OPD maps. The loss is the noise-weighted chi^2 over the
 pixel mask, with the flux solved in closed form at every iteration; nothing is masked
 around companions, so a companion adds the same residual to every geometry.
 
-PyFLIP's defaults: the model directory's Lyot stop as stored, no FPM axial offset,
-registration (-0.12, -0.11) pixels, blur 0.28 pixels. The masks are those of
-fit_geometry_cases.py; the defaults are scored with the smooth mask at 593 um/arcsec.
+PyFLIP as shipped: its mask file (FFT occulter, with the mount), the model directory's
+Lyot stop as stored, no FPM axial offset, registration (-0.12, -0.11) pixels, blur 0.28
+pixels. The masks are those of fit_geometry_cases.py; '_sq' appended treats the
+band-limited raster's samples as square cells.
 
 Frames as in fit_geometry_cases.py (FRAMES = 'model_dir:data_file,...'). Paths and
 options below, or from the environment variables named there. Prints chi^2/N per
-geometry and frame and saves them to OUT_DIR/science_chi2.npz.
+geometry and frame and saves them, the data and the model images to OUT_DIR/science_chi2.npz.
 """
 import os
 import sys
@@ -29,12 +30,10 @@ geometry_dir = os.environ['GEOMETRY_DIR']                    # output of fit_geo
 fpm_raster = os.environ.get('FPM_RASTER')                    # real mask raster (.npz), needed for the real cases
 lyot_file = os.environ['LYOT_FILE']                          # stpsf's MASKRND transmission, 1024 x 1024
 out_dir = os.environ.get('OUT_DIR', 'science_chi2')
-cases = os.environ.get('CASES', 'smooth593,smooth637,real593_bl,real637_bl').split(',')
+cases = os.environ.get('CASES', 'real593_bl_sq,real637_bl_sq').split(',')
 iters = int(os.environ.get('ITERS', 300))
 fpm_focal_length = 131.4                                     # equivalent focal length [m]
 um_per_arcsec = {'593': 593.336, '637': 637.045}
-flip_defaults = {'registration x [px]': -0.12, 'registration y [px]': -0.11, 'blur [px]': 0.28, 'Lyot shift x [% D]': 0.,
-                 'Lyot shift y [% D]': 0., 'Lyot clocking [deg]': 0., 'FPM axial offset [mm]': 0.}
 
 DEVICE = os.environ.get('DEVICE', 'cuda')
 wf_npix = 1024
@@ -60,25 +59,30 @@ _, _, _, _, wlen_weights, _ = load_model_data(data_dir=frames[0][0])
 lyot_amplitude = torch.FloatTensor(np.load(lyot_file)).to(DEVICE)[None]
 geometry_file = np.load(os.path.join(geometry_dir, 'geometry_cases.npz'))
 fitted = {case: dict(zip(geometry_file['keys'], values)) for case, values in zip(geometry_file['cases'], geometry_file['values'])}
-geometries = {'PyFLIP defaults, smooth593': ('smooth593', flip_defaults, False)}
-geometries.update({'fitted, ' + case: (case, fitted[case], True) for case in cases if case in fitted})
+geometries = {'PyFLIP as shipped': ('flip', None)}
+geometries.update({'fitted, ' + case: (case, fitted[case.replace('_sq', '')]) for case in cases if case.replace('_sq', '') in fitted})
 
 
 #### MODEL AND FIT
-def build(model_dir, case, geometry, stpsf_stop):
-    """Wavefront and instrument for one frame at a fixed geometry, nothing free yet."""
-    mask, scale = case.split('_')[0][:-3], case.split('_')[0][-3:]
+def build(model_dir, case, geometry):
+    """Wavefront and instrument for one frame at a fixed geometry (PyFLIP's for case 'flip'), nothing free yet."""
     wavefront = BroadbandWavefront(wf_npix, diameter, wlen_weights, torch.ones(1, dtype=torch.float64),
                                    angles_offset=torch.zeros(2, dtype=torch.float64), DEVICE=DEVICE).to(DEVICE)
+    if case == 'flip':
+        instrument = assemble_JWST_NIRCam_coron(model_dir, num_det_px, DEVICE=DEVICE, oversample=oversample)
+        for parameter in list(wavefront.parameters()) + list(instrument.parameters()):
+            parameter.requires_grad_(False)
+        return wavefront, instrument
+    mask, scale = case.split('_')[0][:-3], case.split('_')[0][-3:]
     instrument = assemble_JWST_NIRCam_coron(model_dir, num_det_px, DEVICE=DEVICE, oversample=oversample, babinet=True, mount=False,
                                             fpm_raster=os.path.join(geometry_dir, 'smooth_MASK335R_raster.npz') if mask == 'smooth' else fpm_raster,
-                                            um_per_arcsec=um_per_arcsec[scale], band_limited=mask == 'smooth' or case.endswith('_bl'),
-                                            fpm_axial_offset=1e-3 * geometry['FPM axial offset [mm]'], fpm_focal_length=fpm_focal_length)
+                                            um_per_arcsec=um_per_arcsec[scale], band_limited=mask == 'smooth' or '_bl' in case,
+                                            square_cells=case.endswith('_sq'), fpm_axial_offset=1e-3 * geometry['FPM axial offset [mm]'],
+                                            fpm_focal_length=fpm_focal_length)
     for parameter in list(wavefront.parameters()) + list(instrument.parameters()):
         parameter.requires_grad_(False)
     lyot = instrument.optical_system.NIRCamLyotstop
-    if stpsf_stop:
-        lyot.amplitude = lyot_amplitude
+    lyot.amplitude = lyot_amplitude
     detector = instrument.optical_system.NIRCamdetector
     detector.subpixel_shift.shift_x = float(geometry['registration x [px]'])
     detector.subpixel_shift.shift_y = float(geometry['registration y [px]'])
@@ -98,7 +102,7 @@ def chi2(PSF, frame):
 
 
 def fit_star(wavefront, instrument, frame):
-    """Star position by Adam with a cosine schedule; final chi^2/N."""
+    """Star position by Adam with a cosine schedule; final chi^2/N and the model image at the fitted flux."""
     wavefront.angles_offset.requires_grad_(True)
     optimizer = torch.optim.Adam([wavefront.angles_offset], lr=4e-9)                     # [rad]
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iters, eta_min=0.)
@@ -108,16 +112,21 @@ def fit_star(wavefront, instrument, frame):
         optimizer.step()
         scheduler.step()
     with torch.no_grad():
-        return chi2(instrument(wavefront), frame).item()
+        PSF = instrument(wavefront)
+        ref, weights, _ = frame
+        flux = (weights * PSF * ref).sum() / (weights * PSF**2).sum()
+        return chi2(PSF, frame).item(), np.squeeze((flux * PSF).cpu().numpy())
 
 
-results = {}
-for name, (case, geometry, stpsf_stop) in geometries.items():
+results, models = {}, {}
+for name, (case, geometry) in geometries.items():
     t0 = time.time()
-    results[name] = []
+    results[name], models[name] = [], []
     for (model_dir, _), frame in zip(frames, data):
-        wavefront, instrument = build(model_dir, case, geometry, stpsf_stop)
-        results[name].append(fit_star(wavefront, instrument, frame))
+        wavefront, instrument = build(model_dir, case, geometry)
+        value, image = fit_star(wavefront, instrument, frame)
+        results[name].append(value)
+        models[name].append(image)
         del wavefront, instrument
         torch.cuda.empty_cache()
     print(name, '| chi2/N per frame', ' '.join('%.2f' % c for c in results[name]), '| mean %.2f | %.0f s'
@@ -127,4 +136,6 @@ for name, (case, geometry, stpsf_stop) in geometries.items():
 for k, (model_dir, path) in enumerate(frames):
     print('frame %d: %s, %s' % (k, model_dir, os.path.basename(path)))
 np.savez(os.path.join(out_dir, 'science_chi2.npz'), geometries=np.array(list(results)), chi2=np.array(list(results.values())),
-         frames=np.array([':'.join(f) for f in frames]))
+         frames=np.array([':'.join(f) for f in frames]), models=np.array(list(models.values())),
+         data=np.array([np.squeeze(frame[0].cpu().numpy()) for frame in data]),
+         weights=np.array([np.squeeze(frame[1].cpu().numpy()) for frame in data]))
