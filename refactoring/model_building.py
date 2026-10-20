@@ -221,11 +221,13 @@ def generate_STPSF_model_params(stpsf_instrument, spec_type='A1V', catalog_spec=
 
 def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,diameter = 6.603464, DEVICE='cuda',
                                oversample=2, wf_npix=1024, fpm_axial_offset=None, fpm_focal_length=None, lyot_axial_offset=None,
-                               babinet=False, mount=True, fpm_raster=None, um_per_arcsec=593.336, band_limited=True):
+                               babinet=False, mount=True, fpm_raster=None, um_per_arcsec=593.336, band_limited=True,
+                               square_cells=False):
     """
     babinet=True applies the focal plane mask through Babinet's principle; mount=False
     drops its mount regions, and fpm_raster replaces the spot by a mask raster file at
-    um_per_arcsec [um/arcsec]; band_limited=False keeps every raster sample (slow).
+    um_per_arcsec [um/arcsec]; band_limited=False keeps every raster sample (slow), and
+    square_cells=True treats the band-limited raster's samples as square cells.
 
     Set fpm_axial_offset [m] and fpm_focal_length [m] to include an axially
     displaced focal plane mask. Both distances refer to the equivalent optical
@@ -282,7 +284,7 @@ def assemble_JWST_NIRCam_coron(data_dir,num_det_px,psf_pixel_scale=0.062424185,d
                                 wfe_offsets=OPDOffsetModule(wf_npix, wf_npix, device=DEVICE))
     if babinet:
         NIRCam_FPM = make_occulter(fpm, wlen_weights[0].cpu(), diameter / wf_npix, wf_npix, mount=mount, fpm_raster=fpm_raster,
-                                   um_per_arcsec=um_per_arcsec, band_limited=band_limited, device=DEVICE,
+                                   um_per_arcsec=um_per_arcsec, band_limited=band_limited, square_cells=square_cells, device=DEVICE,
                                    name='NIRCam coron focal plane mask',
                                    axial_offset=fpm_axial_offset, focal_length=fpm_focal_length).to(DEVICE)
     else:

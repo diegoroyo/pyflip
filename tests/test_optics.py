@@ -577,6 +577,26 @@ def test_band_limited_raster_matches_fine_sum(crop_output):
     assert torch.linalg.vector_norm(actual - expected) < 1e-6 * torch.linalg.vector_norm(expected - padded)
 
 
+def test_square_cells_match_finely_split_cells():
+    """Square cells equal the limit of cells split k x k into points: the band-limited raster
+    with square_cells is much closer to an 8 x 8 split of every cell than the point cells are."""
+    n, d_pupil, wavelength = 16, 0.01, 4e-6
+    d_focal = wavelength / (3 * n * d_pupil)
+    opaque = (asymmetric_field(12).abs() * torch.rand(12, 12, generator=torch.Generator().manual_seed(2)) > 0.3).numpy()
+    axis, k = (5.6, 6.2), 8
+    split = raster_region(np.kron(opaque, np.ones((k, k))), d_focal / k, (k * axis[0] + (k - 1) / 2, k * axis[1] + (k - 1) / 2),
+                          [wavelength], d_pupil, n, band_limited=False)
+    field = asymmetric_field(n)[None, None]
+    expected = BabinetImageOptic([split])(field, n, 2)
+    errors = []
+    for square_cells in (False, True):
+        region = raster_region(opaque, d_focal, axis, [wavelength], d_pupil, n, square_cells=square_cells)
+        errors.append(torch.linalg.vector_norm(BabinetImageOptic([region])(field, n, 2) - expected).item())
+    assert errors[1] < 0.1 * errors[0]
+    with pytest.raises(ValueError):
+        raster_region(opaque, d_focal, axis, [wavelength], d_pupil, n, band_limited=False, square_cells=True)
+
+
 def test_substrate_transmission_reweights_band():
     """Weights keep their sum, are unchanged where the substrate is flat (3.9-4.1 um) and fall
     at the red end of F444W, where it transmits less; one wavelength is left as it is."""
