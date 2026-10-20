@@ -7,6 +7,10 @@ The offset follows the OTE OPD fitting windows: fixed during flux/position
 initialization, fitted on the reference, and frozen on science unless the
 existing --freeze_OTE_OPD_sci flag is used to allow further fitting.
 Free FPM displacement and two free OPD maps do not give a unique geometry fit.
+
+--occulter babinet (default) or fft; --no_mount, --fpm_raster and --um_per_arcsec
+select the mask. --fit_Lyot fits the Lyot stop shift and rotation at --lyot_lr,
+in the same windows as the offset.
 """
 import os
 import tqdm
@@ -35,6 +39,7 @@ from dl_utils import arcsec2rad,calc_snr, circular_mask, merge_injected_planets,
 from model_classes import PerMirrorZernikes, OPDOffsetModule, LinearInterpOPD,PTT_OPD,ZernikeBasis,ZernikeModel
 
 from propagation_classes import Wavefront,BroadbandWavefront,PointPropagate
+from refactoring.optical_elements import BabinetImageOptic, flip_mask_regions, load_raster_region
 
 
 if __name__ == "__main__":
@@ -102,6 +107,11 @@ if __name__ == "__main__":
     parser.add_argument('--offset', default=0., type=float, help='initial axial displacement [primary-equivalent m]')
     parser.add_argument('--offset_lr', default=1e-4, type=float, help='axial learning rate [primary-equivalent m]')
     parser.add_argument('--focal_length', default=131.4, type=float, help='equivalent focal length [m]')
+    parser.add_argument('--occulter', choices=['babinet', 'fft'], default='babinet')
+    parser.add_argument('--no_mount', action='store_true', help='drop the mask mount regions')
+    parser.add_argument('--fpm_raster', default=None, type=str, help='mask raster file (Babinet only)')
+    parser.add_argument('--um_per_arcsec', default=593.336, type=float, help='mask scale for --fpm_raster [um/arcsec]')
+    parser.add_argument('--lyot_lr', default=1e-3, type=float, help='Lyot shift [samples] and rotation [deg] learning rate')
 
     args = parser.parse_args()
 
@@ -124,6 +134,15 @@ if __name__ == "__main__":
 
     nircam_OPD = torch.tensor(nircam_OPD, dtype=torch.float64).to(DEVICE)[None]
     lyot = torch.FloatTensor(lyot).to(DEVICE)[None]
+    occulter = None
+    if args.occulter == 'babinet':
+        regions = flip_mask_regions(fpm, spot=args.fpm_raster is None, mount=not args.no_mount)
+        if args.fpm_raster is not None:
+            regions.append(load_raster_region(args.fpm_raster, args.um_per_arcsec, wlen_weights[0], diameter / wf_npix))
+        occulter = BabinetImageOptic(regions).to(DEVICE)
+    elif args.no_mount or args.fpm_raster is not None:
+        raise ValueError('--no_mount and --fpm_raster need --occulter babinet')
+    geometry['occulter'] = occulter
     fpm = torch.FloatTensor(fpm).to(DEVICE)[None]
     wlen_weights = torch.as_tensor(wlen_weights, dtype=torch.float64, device=DEVICE)
 
@@ -452,6 +471,15 @@ if __name__ == "__main__":
         {'params': optics_params_even_bigger_lr, 'lr': even_bigger_lr},
         {'params': [axial_offset], 'lr': args.offset_lr}
     ]
+    # The Lyot stop geometry is the instrument's, so all integrations share one.
+    lyot_shifts = prop_models[0].lyot_shifts
+    for p_model in prop_models[1:]:
+        p_model.lyot_shifts = lyot_shifts
+    lyot_params = [lyot_shifts.x_shift, lyot_shifts.y_shift, lyot_shifts.rotation]
+    for t in lyot_params:
+        t.requires_grad_(False)
+    if args.fit_Lyot:
+        optimizer_argument.append({'params': lyot_params, 'lr': args.lyot_lr})
 
     # If using two optimizers, currently only AdamW is used, but kept for testing
     optimizer_sgd = torch.optim.SGD(optimizer_argument, momentum=0.9)
@@ -520,6 +548,9 @@ if __name__ == "__main__":
         else:
             fit_offset = i >= args.stage_fluxpos_cutoff_iter
         axial_offset.requires_grad_(fit_offset)
+        if args.fit_Lyot:
+            for t in lyot_params:
+                t.requires_grad_(fit_offset)
 
         # Forward model PSF with current parameters
         pred_1 = [prop_models[j](wavefronts_list1, wfe_batch_list[j], wlen_weights[1], wlen_weights[0]) for j in range(len(prop_models))]
@@ -865,8 +896,12 @@ if __name__ == "__main__":
     np.savez(f'{vis_dir}/axial_displacement.npz', element=args.element,
              axial_offset_m=axial_offset.detach().cpu().numpy(), focal_length_m=args.focal_length,
              history=np.asarray(displacement_history),
-             history_columns=['iteration', 'axial_offset_m', 'loss'])
+             history_columns=['iteration', 'axial_offset_m', 'loss'],
+             lyot_shift_samples=[lyot_shifts.x_shift.item(), lyot_shifts.y_shift.item()],
+             lyot_rotation_deg=lyot_shifts.rotation.item())
     print(f'{args.element} axial displacement: {axial_offset.item():.8g} primary-equivalent m')
+    print('Lyot stop shift (x, y) [samples]:', lyot_shifts.x_shift.item(), lyot_shifts.y_shift.item(),
+          '| rotation [deg]:', lyot_shifts.rotation.item())
 
     # End of loop; now save results
     if args.track_injected_planet:

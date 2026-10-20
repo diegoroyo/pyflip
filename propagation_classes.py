@@ -5,7 +5,7 @@ import numpy as np
 import math 
 from dl_utils import pixel_coords, crop_to, partial_MFT,shift_image_subpixel
 from model_classes import ShiftModule, GridOffsetModule,FlatFieldingModule,PerMirrorZernikes, OPDOffsetModule, FluxOffsetModule,AngleOffsetModule,LinearInterpOPD,PTT_OPD,LearnableGaussianBlur
-from refactoring.optical_elements import DiffImageOptic, DiffLyotOptic
+from refactoring.optical_elements import DiffImageOptic, DiffLyotOptic, BabinetImageOptic
 
 
 
@@ -204,9 +204,12 @@ class PointPropagate(nn.Module):
         corresponding mask in its nominal plane.
     focal_length : float
         Equivalent focal length [m] used for FPM displacement.
+    occulter : BabinetImageOptic, optional
+        Focal plane mask applied through Babinet's principle. None uses the
+        transmission `fpm` on the full padded focal grid.
     """
     def __init__(self, aperture, lyot, fpm, nircam_opd, args,oversample=None, use_ptt = None,OTE_wfe_basis=None,second_delta_wfe=None, num_det_px = 80,
-                 fpm_axial_offset=None, lyot_axial_offset=None, focal_length=131.4):
+                 fpm_axial_offset=None, lyot_axial_offset=None, focal_length=131.4, occulter=None):
         super().__init__()
         self.aperture = aperture
         self.lyot = lyot
@@ -219,12 +222,16 @@ class PointPropagate(nn.Module):
 
         self.fpm_optic = None
         self.lyot_optic = None
-        if fpm_axial_offset is not None or lyot_axial_offset is not None:
-            if fpm_axial_offset is not None and focal_length <= 0:
-                raise ValueError('FPM displacement requires a positive equivalent focal length')
-            self.fpm_optic = DiffImageOptic(amplitude=fpm, focal_length=focal_length)
-            self.lyot_optic = DiffLyotOptic(amplitude=lyot, wfe_offsets=nn.Identity())
+        if fpm_axial_offset is not None and focal_length <= 0:
+            raise ValueError('FPM displacement requires a positive equivalent focal length')
+        if occulter is not None:
+            self.fpm_optic = occulter
+        elif fpm_axial_offset is not None or lyot_axial_offset is not None:
+            self.fpm_optic = DiffImageOptic(amplitude=fpm)
+        if self.fpm_optic is not None:
+            self.fpm_optic.focal_length = focal_length
             self.fpm_optic.axial_offset = fpm_axial_offset
+            self.lyot_optic = DiffLyotOptic(amplitude=lyot, wfe_offsets=nn.Identity())
             self.lyot_optic.axial_offset = lyot_axial_offset
 
         self.lyot_shifts = ShiftModule(lyot.shape[-2], lyot.shape[-1])
@@ -265,7 +272,8 @@ class PointPropagate(nn.Module):
         if self.fpm_optic is None:
             focal_return = wavefront.forward_fpm(phasors, self.fpm, oversample=self.oversample)
             return wavefront.forward(focal_return, self.lyot_shifts(self.lyot))
-        self.fpm_optic.amplitude = self.fpm
+        if isinstance(self.fpm_optic, DiffImageOptic):
+            self.fpm_optic.amplitude = self.fpm
         full_pupil = self.lyot_optic.axial_offset is not None
         returned = self.fpm_optic(phasors, wavefront.npixels, self.oversample,
                                   wavelengths=wavefront.wavelengths, d_pupil=wavefront.pixel_scale,
