@@ -2,14 +2,17 @@ import torch.nn as nn
 import torch
 import numpy as np 
 import sys
+from scipy import ndimage
 if __package__:
     from .model_classes import OPDOffsetModule, LearnableGaussianBlur, FlatFieldingModule, DetSubPixShift, ShiftModule
     from .dl_utils import crop_to, partial_MFT, shift_image_subpixel
     from .diffraction import FresnelTransfer, propagate_wavelengths
+    from .bluestein_fft import bluestein_fft
 else:
     from model_classes import OPDOffsetModule, LearnableGaussianBlur, FlatFieldingModule, DetSubPixShift, ShiftModule
     from dl_utils import crop_to, partial_MFT, shift_image_subpixel
     from diffraction import FresnelTransfer, propagate_wavelengths
+    from bluestein_fft import bluestein_fft
 
 class DiffOpticalElement(nn.Module):
     def __init__(self, name=None):
@@ -230,6 +233,216 @@ class DiffImageOptic(DiffOpticalElement):
         returned = propagate_wavelengths(displaced * self.amplitude, propagators, -self.axial_offset)
         return returned * phase_factor
     
+
+class BlockedRegion(nn.Module):
+    """Part of a focal plane mask's blocked amplitude, 1 - t, on its own focal window.
+
+    Attributes
+    ----------
+    blocked : torch.Tensor
+        Blocked amplitude, shape (n_wl or 1, n, n).
+    centre : tuple of float
+        Window centre (y, x) relative to the optical axis [focal samples].
+    n_fft : torch.Tensor
+        Focal samples per period, wavelength / (d_pupil * d_focal), shape (n_wl,) or (1,).
+    """
+    def __init__(self, blocked, centre, n_fft):
+        super().__init__()
+        self.register_buffer('blocked', torch.as_tensor(np.asarray(blocked), dtype=torch.float64))
+        self.register_buffer('n_fft', torch.as_tensor(np.asarray(n_fft), dtype=torch.float64).reshape(-1))
+        self.centre = tuple(float(c) for c in centre)
+
+    def propagate(self, field, n_out):
+        """Field the region blocks, returned to the second pupil.
+
+        Parameters
+        ----------
+        field : torch.Tensor
+            Complex pupil field, shape (..., n_wl, n, n).
+        n_out : int
+            Number of output samples.
+
+        Returns
+        -------
+        torch.Tensor
+            Blocked field at the second pupil, shape (..., n_wl, n_out, n_out).
+        """
+        if self.n_fft.numel() == 1:
+            return self._propagate(field, self.blocked, float(self.n_fft), n_out)
+        return torch.stack([self._propagate(field[..., i, :, :], self.blocked[min(i, len(self.blocked) - 1)],
+                                            float(n_fft), n_out)
+                            for i, n_fft in enumerate(self.n_fft)], dim=-3)
+
+    def _propagate(self, field, blocked, n_fft, n_out):
+        focal = bluestein_fft(field, blocked.shape[-1], n_fft, centre_out=self.centre) / n_fft**2
+        return bluestein_fft(focal * blocked.to(field.dtype), n_out, n_fft, inverse=True, centre_in=self.centre)
+
+
+class BlockedBand(nn.Module):
+    """Blocked amplitude uniform across whole focal rows; only y is transformed.
+
+    Attributes
+    ----------
+    blocked : torch.Tensor
+        Blocked amplitude per focal row, shape (n_wl or 1, M), optical axis at row M // 2.
+    """
+    def __init__(self, blocked):
+        super().__init__()
+        self.register_buffer('blocked', torch.as_tensor(np.asarray(blocked), dtype=torch.float64))
+
+    def propagate(self, field, n_out):
+        """Field the band blocks, returned to the second pupil, shape (..., n_wl, n_out, n_out)."""
+        # The x transforms over one whole period cancel.
+        n, M = field.shape[-1], self.blocked.shape[-1]
+        padded = torch.nn.functional.pad(field, (0, 0, (M - n) // 2, (M - n) // 2))
+        focal = torch.fft.fftshift(torch.fft.ifft(padded, dim=-2), dim=-2)
+        returned = torch.fft.fft(torch.fft.fftshift(focal * self.blocked[..., :, None].to(field.dtype), dim=-2), dim=-2)
+        returned = returned[..., (M - n_out) // 2:(M + n_out) // 2, :]
+        return torch.nn.functional.pad(returned, ((n_out - n) // 2,) * 2)
+
+
+class BabinetImageOptic(DiffOpticalElement):
+    """Focal plane mask applied through Babinet's principle.
+
+    Only the blocked amplitude b = 1 - t is propagated, on each region's window:
+        E_p2 = E_p1 - sum over regions of T_back[ b * T[E_p1] ]
+
+    Attributes
+    ----------
+    regions : nn.ModuleList of BlockedRegion or BlockedBand
+        Disjoint parts of the blocked amplitude.
+    axial_offset : torch.nn.Parameter or None
+        Mask displacement along the beam [primary-equivalent m], positive downstream.
+    focal_length : float
+        Equivalent focal length [m].
+
+    Notes
+    -----
+    The displacement is the pupil phase exp(-i pi dz r^2 / (wavelength F^2)) before
+    the mask and its conjugate after: exact Fresnel propagation, as no focal field
+    is truncated.
+    """
+    def __init__(self, regions, name=None, axial_offset=None, focal_length=None):
+        super().__init__()
+        self.name = name
+        self.optic_type = 'image'
+        self.regions = nn.ModuleList(regions)
+        self.focal_length = focal_length
+        self.axial_offset = None
+        if axial_offset is not None:
+            if focal_length is None or focal_length <= 0:
+                raise ValueError('axial displacement requires a positive equivalent focal length')
+            self.axial_offset = nn.Parameter(torch.as_tensor(axial_offset, dtype=torch.float64))
+
+    def forward(self, phasor, npixels_in, oversample=2, wavelengths=None, d_pupil=None, crop_output=True):
+        """Field at the second pupil, on npixels_in samples, or npixels_in * oversample if not cropped."""
+        n_out = npixels_in if crop_output else npixels_in * oversample
+        field = phasor.to(torch.complex128)
+        if self.axial_offset is not None:
+            field = field * self.defocus(npixels_in, wavelengths, d_pupil)
+        blocked = sum(region.propagate(field, n_out) for region in self.regions)
+        if self.axial_offset is not None:
+            blocked = blocked * self.defocus(n_out, wavelengths, d_pupil).conj()
+        return torch.nn.functional.pad(phasor, ((n_out - npixels_in) // 2,) * 4) - blocked
+
+    def defocus(self, n, wavelengths, d_pupil):
+        """Pupil phase of the mask displacement, shape (n_wl, n, n)."""
+        axis = (torch.arange(n, device=self.axial_offset.device, dtype=torch.float64) - (n - 1) / 2) * d_pupil
+        radius2 = axis[:, None].square() + axis[None, :].square()
+        wavelengths = wavelengths.to(device=axis.device, dtype=torch.float64)[:, None, None]
+        return torch.exp(-1j * torch.pi * self.axial_offset * radius2 / (wavelengths * self.focal_length**2))
+
+
+def square_window(array, start):
+    """Zero-pad the last two axes to a square; returns it and its centre (y, x) [samples]."""
+    n = max(array.shape[-2:])
+    array = np.pad(array, [(0, 0)] * (array.ndim - 2) + [(0, n - array.shape[-2]), (0, n - array.shape[-1])])
+    return array, (start[0] + (n - 1) / 2, start[1] + (n - 1) / 2)
+
+
+def flip_mask_regions(fpm, spot=True, mount=True):
+    """Split PyFLIP's focal plane mask files into a band and connected regions.
+
+    Parameters
+    ----------
+    fpm : array_like
+        Amplitude transmission on PyFLIP's focal grid, shape (n_wl, M, M), optical axis at M // 2.
+    spot : bool, optional
+        Keep the region on the optical axis.
+    mount : bool, optional
+        Keep the regions off the axis.
+
+    Returns
+    -------
+    list of BlockedRegion and BlockedBand
+    """
+    blocked = 1 - np.asarray(fpm, dtype=np.float64).reshape((-1,) + np.shape(fpm)[-2:])
+    M = blocked.shape[-1]
+    axis = M // 2
+    uniform = (blocked == blocked[..., :1]).all(-1) & (blocked[..., 0] != 0)
+    band = np.where(uniform, blocked[..., 0], 0.)
+    rest = blocked - band[..., None]
+    regions = [BlockedBand(band)] if mount and band.any() else []
+    labels, _ = ndimage.label(rest.any(0))
+    for k, (ys, xs) in enumerate(ndimage.find_objects(labels), start=1):
+        on_axis = ys.start <= axis < ys.stop and xs.start <= axis < xs.stop
+        if spot if on_axis else mount:
+            window, centre = square_window(np.where(labels[ys, xs] == k, rest[:, ys, xs], 0.), (ys.start, xs.start))
+            regions.append(BlockedRegion(window, (centre[0] - axis, centre[1] - axis), M))
+    return regions
+
+
+def raster_region(opaque, d_focal, axis, wavelengths, d_pupil):
+    """Blocked region of a raster of opaque cells, clear outside.
+
+    Parameters
+    ----------
+    opaque : array_like of bool
+        True where the mask is opaque, shape (n_y, n_x), rows along y.
+    d_focal : float
+        Spatial sampling interval of the raster on the sky [rad].
+    axis : tuple of float
+        Position (y, x) of the optical axis in the raster [samples].
+    wavelengths : array_like
+        Wavelengths of the light [m], shape (n_wl,).
+    d_pupil : float
+        Spatial sampling interval of the pupil field [m].
+
+    Returns
+    -------
+    BlockedRegion
+    """
+    window, centre = square_window(np.asarray(opaque, dtype=np.float64)[None], (0, 0))
+    n_fft = np.asarray(wavelengths, dtype=np.float64) / (float(d_pupil) * d_focal)
+    return BlockedRegion(window, (centre[0] - axis[0], centre[1] - axis[1]), n_fft)
+
+
+def load_raster_region(path, um_per_arcsec, wavelengths, d_pupil):
+    """Blocked region from a mask raster file, with the optical axis at the opaque centroid.
+
+    Parameters
+    ----------
+    path : str
+        .npz with `opaque`, cell size `pitch_um`, first-cell corner `x0_um`, `y0_um`
+        and `centroid_um` (x, y), in um at the mask.
+    um_per_arcsec : float
+        Mask scale on the sky [um/arcsec].
+    wavelengths : array_like
+        Wavelengths of the light [m], shape (n_wl,).
+    d_pupil : float
+        Spatial sampling interval of the pupil field [m].
+
+    Returns
+    -------
+    BlockedRegion
+    """
+    raster = np.load(path)
+    d_um = float(raster['pitch_um'])
+    # Cell i covers [x0 + i d, x0 + (i + 1) d].
+    axis = ((raster['centroid_um'][1] - raster['y0_um']) / d_um - 0.5,
+            (raster['centroid_um'][0] - raster['x0_um']) / d_um - 0.5)
+    return raster_region(raster['opaque'], d_um / um_per_arcsec * np.pi / (180 * 3600), axis, wavelengths, d_pupil)
+
 
 class DiffDetector(DiffOpticalElement):
     def __init__(self,args,oversample=2, name=None, num_det_px=80, shift_x=-0.12, shift_y=-0.11, device='cuda'):

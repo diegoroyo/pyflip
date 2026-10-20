@@ -8,7 +8,8 @@ import torch
 from types import SimpleNamespace
 
 from dl_utils import dl_MFT, crop_to
-from optical_elements import DiffImageOptic, DiffPupilOptic, DiffLyotOptic, DiffOpticalSystem, DiffDetector
+from optical_elements import (DiffImageOptic, DiffPupilOptic, DiffLyotOptic, DiffOpticalSystem, DiffDetector,
+                              BabinetImageOptic, BlockedBand, flip_mask_regions, raster_region)
 from bluestein_fft import bluestein_fft, centered_fft
 from model_classes import ShiftModule
 from diffraction import FresnelSingle, FresnelTransfer
@@ -425,6 +426,126 @@ def test_optimizer_recovers_injected_offset(element, true_offset):
         losses.append(loss.item())
     assert losses[-1] < losses[0] * 1e-5
     assert offset.item() == pytest.approx(true_offset, rel=0.01)
+
+
+@pytest.mark.parametrize('inverse', [False, True])
+@pytest.mark.parametrize('n_in, n_out, period, centre_in, centre_out',
+                         [(8, 5, 16., (0., 0.), (3.5, -2.)), (7, 10, 17.25, (-1.5, 0.25), (0., 0.)),
+                          (9, 4, 12., (0.5, 1.), (-2., 0.75))])
+def test_bluestein_off_axis_windows_against_direct_sum(inverse, n_in, n_out, period, centre_in, centre_out):
+    """Windows centred off the origin match the Fourier sum written out directly."""
+    field = asymmetric_field(n_in)
+    sign = -1 if inverse else 1
+    x = [torch.arange(n_in, dtype=torch.float64) - (n_in - 1)/2 + c for c in centre_in]
+    u = [torch.arange(n_out, dtype=torch.float64) - (n_out - 1)/2 + c for c in centre_out]
+    matrix = [torch.exp(sign * 2j * torch.pi * u[i][:, None] * x[i][None, :] / period) for i in range(2)]
+    direct = matrix[0] @ field @ matrix[1].T
+    actual = bluestein_fft(field, n_out, period, inverse, centre_in=centre_in, centre_out=centre_out)
+    torch.testing.assert_close(actual, direct, rtol=1e-12, atol=1e-12)
+
+
+def occulter_mask(n_focal, n_wl=2):
+    """Transmission on PyFLIP's focal grid: a smooth spot on the axis, an off-axis
+    gray square and an opaque band across the whole grid, shape (n_wl, n_focal, n_focal)."""
+    axis = torch.arange(n_focal, dtype=torch.float64) - n_focal // 2
+    radius2 = axis[:, None].square() + axis[None, :].square()
+    mask = torch.ones(n_wl, n_focal, n_focal, dtype=torch.float64)
+    for i in range(n_wl):
+        width = 1.5 + 0.5 * i
+        mask[i] = torch.where(radius2 <= 9, 1 - 0.9 * torch.exp(-radius2 / width**2), 1.)
+    mask[:, 3:6, 22:27] = 0.3
+    mask[:, -4:-2, :] = 0.
+    return mask
+
+
+def test_flip_mask_regions_split_spot_and_mount():
+    regions = flip_mask_regions(occulter_mask(32))
+    assert sorted(isinstance(region, BlockedBand) for region in regions) == [False, False, True]
+    spot_only = flip_mask_regions(occulter_mask(32), mount=False)
+    assert len(spot_only) == 1 and spot_only[0].centre == (0., 0.)
+
+
+@pytest.mark.parametrize('crop_output', [True, False])
+def test_babinet_matches_fft_chain(crop_output):
+    """Babinet on the blocked windows equals PyFLIP's full padded focal grid."""
+    n = 16
+    mask = occulter_mask(2 * n)
+    field = torch.stack([asymmetric_field(n), 1j * asymmetric_field(n).conj()])[None]
+    expected = DiffImageOptic(amplitude=mask[None])(field, n, 2, crop_output=crop_output)
+    actual = BabinetImageOptic(flip_mask_regions(mask))(field, n, 2, crop_output=crop_output)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-14)
+
+
+def test_babinet_without_mount_equals_clear_mount():
+    n = 16
+    mask = occulter_mask(2 * n)
+    spot = mask.clone()
+    spot[:, 3:6, 22:27] = 1.
+    spot[:, -4:-2, :] = 1.
+    field = asymmetric_field(n)[None].expand(2, n, n)[None]
+    expected = DiffImageOptic(amplitude=spot[None])(field, n, 2)
+    actual = BabinetImageOptic(flip_mask_regions(mask, mount=False))(field, n, 2)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-14)
+
+
+def test_babinet_clear_mask_returns_field():
+    field = asymmetric_field(8)[None, None]
+    clear = BabinetImageOptic(flip_mask_regions(torch.ones(1, 16, 16)))
+    torch.testing.assert_close(clear(field, 8, 2), field, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('z', [-0.002, 0., 0.002])
+def test_babinet_axial_matches_fresnel(z):
+    """The pupil phase pair equals Fresnel propagation over z around the mask."""
+    n, d_x, focal_length = 16, 0.01, 1.
+    wavelengths = torch.tensor([4e-6, 5e-6], dtype=torch.float64)
+    mask = occulter_mask(2 * n)
+    field = torch.stack([asymmetric_field(n), 1j * asymmetric_field(n)])[None]
+    fresnel = DiffImageOptic(amplitude=mask[None], axial_offset=z, focal_length=focal_length)
+    babinet = BabinetImageOptic(flip_mask_regions(mask), axial_offset=z, focal_length=focal_length)
+    expected = fresnel(field, n, 2, wavelengths=wavelengths, d_pupil=d_x)
+    actual = babinet(field, n, 2, wavelengths=wavelengths, d_pupil=d_x)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-13)
+    if z != 0:
+        nominal = BabinetImageOptic(flip_mask_regions(mask))(field, n, 2)
+        assert torch.linalg.vector_norm(actual - nominal) > 1e-3 * torch.linalg.vector_norm(nominal)
+
+
+@pytest.mark.parametrize('z', [0., 0.002])
+def test_babinet_axial_gradient(z):
+    field = asymmetric_field(16)[None]
+    wavelengths = torch.tensor([4e-6], dtype=torch.float64)
+    optic = BabinetImageOptic(flip_mask_regions(occulter_mask(32, 1)), axial_offset=z, focal_length=1.)
+
+    def measurement():
+        return optic(field, 16, 2, wavelengths=wavelengths, d_pupil=0.01)[0, 7, 9].abs().square()
+
+    derivative, = torch.autograd.grad(measurement(), optic.axial_offset)
+    step = 1e-7
+    with torch.no_grad():
+        optic.axial_offset.fill_(z + step)
+        plus = measurement()
+        optic.axial_offset.fill_(z - step)
+        minus = measurement()
+    assert abs(derivative) > 1e-5
+    torch.testing.assert_close(derivative, (plus - minus) / (2 * step), rtol=1e-6, atol=1e-8)
+
+
+def test_raster_region_on_focal_grid():
+    """A raster sampled like PyFLIP's focal grid, with the axis inside it, gives the
+    same field as that binary mask on the full grid (checks scale and placement)."""
+    n, d_pupil, wavelength = 16, 0.01, 4e-6
+    opaque = asymmetric_field(9).abs() > 0.6
+    opaque = torch.cat([opaque, torch.zeros(9, 2, dtype=torch.bool)], 1)    # 9 x 11, nonsymmetric
+    axis = (5., 3.)                                                          # optical axis in the raster
+    mask = torch.ones(1, 2 * n, 2 * n, dtype=torch.float64)
+    mask[0, n - 5:n + 4, n - 3:n + 8] = (~opaque).double()
+    d_focal = wavelength / (2 * n * d_pupil)
+    region = raster_region(opaque.numpy(), d_focal, axis, [wavelength], d_pupil)
+    field = asymmetric_field(n)[None, None]
+    expected = DiffImageOptic(amplitude=mask[None])(field, n, 2)
+    actual = BabinetImageOptic([region])(field, n, 2)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-14)
 
 
 def test_shift_module_identity_and_integer_shift():

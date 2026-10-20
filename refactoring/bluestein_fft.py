@@ -24,7 +24,7 @@ def _fixed_chirps(n_in, n_out, n_fft, device, dtype):
     return _chirps(n_in, n_out, n_fft, device, dtype)
 
 
-def bluestein_fft(field, n_out, n_fft, inverse=False):
+def bluestein_fft(field, n_out, n_fft, inverse=False, centre_in=(0., 0.), centre_out=(0., 0.)):
     """Compute a zoomed 2D Fourier transform using the Bluestein algorithm.
 
     Parameters
@@ -38,6 +38,9 @@ def bluestein_fft(field, n_out, n_fft, inverse=False):
         a negative value reverses the transform sign. Must be nonzero.
     inverse : bool, optional
         Use a negative exponent instead of PyFLIP's positive forward exponent.
+    centre_in, centre_out : tuple of float, optional
+        Centre (y, x) of the input and output windows [samples]; (0, 0) is the
+        optical axis.
 
     Returns
     -------
@@ -46,11 +49,15 @@ def bluestein_fft(field, n_out, n_fft, inverse=False):
 
     Notes
     -----
-    Input and output coordinates are centered on (n - 1)/2. The equivalent
+    Coordinates are centred on (n - 1)/2 plus the window centre. The equivalent
     zero-padded array is not allocated. Chirps are cached for fixed sampling
     and recalculated when gradients through the sampling are required.
     """
     n_in = field.shape[-1]
+    scale = (-1 if inverse else 1) / n_fft
+    # A shifted window is a linear phase on the other grid.
+    if any(centre_out):
+        field = field * _linear_phase(n_in, centre_out, scale, field)
     n_fft = n_fft if inverse else -n_fft
     if torch.is_tensor(n_fft) and n_fft.requires_grad:
         chirp_in, chirp_out, h_fft = _chirps(n_in, n_out, n_fft, field.device, field.dtype)
@@ -61,7 +68,17 @@ def bluestein_fft(field, n_out, n_fft, inverse=False):
     field_fft = torch.fft.fft2(input_field, s=(size, size))
     convolution = torch.fft.ifft2(field_fft * h_fft[:, None] * h_fft[None, :])
     result = convolution[..., n_in - 1:n_in - 1 + n_out, n_in - 1:n_in - 1 + n_out]
-    return result * chirp_out[:, None] * chirp_out[None, :]
+    result = result * chirp_out[:, None] * chirp_out[None, :]
+    if any(centre_in):
+        result = result * _linear_phase(n_out, centre_in, scale, field, centre_out)
+    return result
+
+
+def _linear_phase(n, slope, scale, like, origin=(0., 0.)):
+    """exp(2 pi i scale (slope_y (y + origin_y) + slope_x (x + origin_x))) on a centred n x n grid."""
+    axis = torch.arange(n, device=like.device, dtype=torch.float64) - (n - 1) / 2
+    phase = slope[0] * (axis[:, None] + origin[0]) + slope[1] * (axis[None, :] + origin[1])
+    return torch.exp(2j * torch.pi * scale * phase).to(like.dtype)
 
 
 def centered_fft(field, inverse=False):
