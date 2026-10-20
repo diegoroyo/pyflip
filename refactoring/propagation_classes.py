@@ -216,7 +216,7 @@ class PointPropagate(nn.Module):
 
         if self.oversample!=1:
             kernel_sigma = 0.28 * self.oversample
-            kernel_size = round(4.0 * kernel_sigma)
+            kernel_size = 2 * int(np.ceil(4.0 * kernel_sigma)) + 1   # odd, so the kernel stays centred
 
             self.charge_diffusion = LearnableGaussianBlur(kernel_size=kernel_size, init_sigma=kernel_sigma)
         else:

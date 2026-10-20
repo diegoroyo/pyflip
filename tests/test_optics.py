@@ -640,6 +640,19 @@ def test_detector_shift_matches_fixed_shift_and_has_gradient():
         assert parameter.grad.item() == pytest.approx(((plus - minus) / (2 * h)).item(), rel=1e-6)
 
 
+def test_detector_blur_is_centred_and_conserves_flux():
+    """The detector blur of a centred point is symmetric about it and keeps its total."""
+    n = 9
+    args = (n, torch.tensor([1e-6]), 1e-3, n, 1e-6 / (n * 1e-3), None, [0., 0.], True, False)
+    blur = DiffDetector(args, oversample=2, num_det_px=n, device='cpu').charge_diffusion
+    point = torch.zeros(1, 1, 1, 2 * n + 1, 2 * n + 1, dtype=torch.float64)
+    point[..., n, n] = 1.
+    blurred = blur(point)[0, 0, 0]
+    torch.testing.assert_close(blurred, blurred.flip(0), rtol=0, atol=1e-15)
+    torch.testing.assert_close(blurred, blurred.flip(1), rtol=0, atol=1e-15)
+    assert blurred.sum().item() == pytest.approx(1., abs=1e-12)
+
+
 def test_shift_module_rotation_direction_and_gradient():
     """+90 deg turns +x into +y; shift and rotation gradients match finite differences."""
     mask = torch.zeros(1, 9, 9, dtype=torch.float64)

@@ -392,6 +392,8 @@ class PTT_OPD(nn.Module):
 class LearnableGaussianBlur(nn.Module):
     def __init__(self, kernel_size=3, init_sigma=0.28):
         super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError('kernel_size must be odd: padding="same" shifts an even kernel by half a sample')
         self.kernel_size = kernel_size
         self.log_sigma = nn.Parameter(torch.log(torch.tensor(init_sigma)))  # Learn in log-space
 

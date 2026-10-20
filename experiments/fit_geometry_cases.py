@@ -37,7 +37,6 @@ fpm_focal_length = 131.4                                     # equivalent focal 
 lyot_start = (-10.35, -7.84, -0.484)                         # stop shift x, y [samples] and clocking [deg] from LYOT_FILE
 fpm_axial_start = -2.195e-3                                  # FPM axial offset [m]
 blur_start = 0.35                                            # blur sigma [detector pixels]
-blur_kernel = 9                                              # blur kernel size [oversampled pixels], odd so it stays centred
 um_per_arcsec = {'593': 593.336, '637': 637.045}
 
 DEVICE = os.environ.get('DEVICE', 'cuda')
@@ -101,7 +100,6 @@ def build(case):
     detector = instrument.optical_system.NIRCamdetector
     detector.subpixel_shift.shift_x = nn.Parameter(torch.zeros((), dtype=torch.float64, device=DEVICE))
     detector.subpixel_shift.shift_y = nn.Parameter(torch.zeros((), dtype=torch.float64, device=DEVICE))
-    detector.charge_diffusion.kernel_size = blur_kernel
     with torch.no_grad():
         lyot.pupil_shifts.x_shift.fill_(lyot_start[0])
         lyot.pupil_shifts.y_shift.fill_(lyot_start[1])
