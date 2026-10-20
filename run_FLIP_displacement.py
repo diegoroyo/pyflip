@@ -111,6 +111,7 @@ if __name__ == "__main__":
     parser.add_argument('--no_mount', action='store_true', help='drop the mask mount regions')
     parser.add_argument('--fpm_raster', default=None, type=str, help='mask raster file (Babinet only)')
     parser.add_argument('--um_per_arcsec', default=593.336, type=float, help='mask scale for --fpm_raster [um/arcsec]')
+    parser.add_argument('--fine_raster', action='store_true', help='use every raster sample instead of the band-limited mask (slow)')
     parser.add_argument('--lyot_lr', default=1e-3, type=float, help='Lyot shift [samples] and rotation [deg] learning rate')
 
     args = parser.parse_args()
@@ -137,7 +138,8 @@ if __name__ == "__main__":
     occulter = None
     if args.occulter == 'babinet':
         occulter = make_occulter(fpm, wlen_weights[0], diameter / wf_npix, wf_npix, mount=not args.no_mount,
-                                 fpm_raster=args.fpm_raster, um_per_arcsec=args.um_per_arcsec, device=DEVICE).to(DEVICE)
+                                 fpm_raster=args.fpm_raster, um_per_arcsec=args.um_per_arcsec,
+                                 band_limited=not args.fine_raster, device=DEVICE).to(DEVICE)
     elif args.no_mount or args.fpm_raster is not None:
         raise ValueError('--no_mount and --fpm_raster need --occulter babinet')
     geometry['occulter'] = occulter

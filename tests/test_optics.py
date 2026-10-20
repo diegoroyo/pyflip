@@ -561,15 +561,13 @@ def test_raster_region_on_focal_grid():
 
 @pytest.mark.parametrize('crop_output', [True, False])
 def test_band_limited_raster_matches_fine_sum(crop_output):
-    """A raster much finer than the pupil grid resolves, low-passed, returns the same field."""
-    from optical_elements import BlockedRegion
+    """The band-limited raster returns the same field as every raster sample (the slow path)."""
     n, d_pupil = 16, 0.01
     wavelengths = [4e-6, 5e-6]
     d_focal = 4e-6 / (12 * n * d_pupil)
     opaque = (asymmetric_field(40).abs() * torch.rand(40, 40, generator=torch.Generator().manual_seed(1)) > 0.3).numpy()
     axis = (19.3, 21.7)
-    fine = BlockedRegion(opaque[None].astype(float), (19.5 - axis[0], 19.5 - axis[1]),
-                         [w / (d_pupil * d_focal) for w in wavelengths])
+    fine = raster_region(opaque, d_focal, axis, wavelengths, d_pupil, n, band_limited=False)
     field = torch.stack([asymmetric_field(n), 1j * asymmetric_field(n)])[None]
     expected = BabinetImageOptic([fine])(field, n, 2, crop_output=crop_output)
     actual = BabinetImageOptic([raster_region(opaque, d_focal, axis, wavelengths, d_pupil, n)])(field, n, 2,

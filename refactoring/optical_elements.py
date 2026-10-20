@@ -385,8 +385,8 @@ def flip_mask_regions(fpm, spot=True, mount=True):
     return regions
 
 
-def raster_region(opaque, d_focal, axis, wavelengths, d_pupil, n_pupil, margin=10., device=None):
-    """Blocked region of a raster of opaque cells, clear outside, band-limited to what the pupil grid sees.
+def raster_region(opaque, d_focal, axis, wavelengths, d_pupil, n_pupil, band_limited=True, margin=10., device=None):
+    """Blocked region of a raster of opaque cells, clear outside.
 
     Parameters
     ----------
@@ -402,6 +402,9 @@ def raster_region(opaque, d_focal, axis, wavelengths, d_pupil, n_pupil, margin=1
         Spatial sampling interval of the pupil field [m].
     n_pupil : int
         Number of pupil samples; the second pupil may have up to 2 n_pupil.
+    band_limited : bool, optional
+        Low-pass the raster to what the pupil grid sees (fast); False keeps every raster
+        sample (slow, the direct sums).
     margin : float, optional
         Window margin beyond the raster [wavelength / (n_pupil d_pupil)].
     device : torch.device or str, optional
@@ -418,9 +421,12 @@ def raster_region(opaque, d_focal, axis, wavelengths, d_pupil, n_pupil, margin=1
     (raised cosine to twice that) and sampled finely enough for the sums to stay exact;
     only the truncation at the margin remains.
     """
-    reach = 1.5 * n_pupil * d_pupil
     n_y, n_x = np.shape(opaque)
     centre = ((n_y - 1) / 2 - axis[0], (n_x - 1) / 2 - axis[1])
+    if not band_limited:
+        n_fft = np.asarray(wavelengths, dtype=np.float64) / (float(d_pupil) * d_focal)
+        return BlockedRegion(np.asarray(opaque, dtype=np.float64)[None], centre, n_fft)
+    reach = 1.5 * n_pupil * d_pupil
     extent = max(abs(centre[0]) + (n_y - 1) / 2, abs(centre[1]) + (n_x - 1) / 2) * d_focal
     wavelengths = np.asarray(wavelengths, dtype=np.float64)
     n_window = 2 * int(np.ceil(extent * 3 * reach / wavelengths.min() + margin * 3 * reach / (n_pupil * d_pupil))) + 1
@@ -438,7 +444,7 @@ def raster_region(opaque, d_focal, axis, wavelengths, d_pupil, n_pupil, margin=1
     return BlockedRegion(torch.stack(blocked).cpu().numpy(), (0., 0.), 3 * reach / d_pupil)
 
 
-def load_raster_region(path, um_per_arcsec, wavelengths, d_pupil, n_pupil, device=None):
+def load_raster_region(path, um_per_arcsec, wavelengths, d_pupil, n_pupil, band_limited=True, device=None):
     """Blocked region from a mask raster file, with the optical axis at the opaque centroid.
 
     Parameters
@@ -454,6 +460,8 @@ def load_raster_region(path, um_per_arcsec, wavelengths, d_pupil, n_pupil, devic
         Spatial sampling interval of the pupil field [m].
     n_pupil : int
         Number of pupil samples.
+    band_limited : bool, optional
+        See raster_region.
     device : torch.device or str, optional
         Device for the one-time filtering.
 
@@ -467,11 +475,11 @@ def load_raster_region(path, um_per_arcsec, wavelengths, d_pupil, n_pupil, devic
     axis = ((raster['centroid_um'][1] - raster['y0_um']) / d_um - 0.5,
             (raster['centroid_um'][0] - raster['x0_um']) / d_um - 0.5)
     return raster_region(raster['opaque'], d_um / um_per_arcsec * np.pi / (180 * 3600), axis, wavelengths, d_pupil,
-                         n_pupil, device=device)
+                         n_pupil, band_limited, device=device)
 
 
-def make_occulter(fpm, wavelengths, d_pupil, n_pupil, mount=True, fpm_raster=None, um_per_arcsec=593.336, device=None,
-                  **kwargs):
+def make_occulter(fpm, wavelengths, d_pupil, n_pupil, mount=True, fpm_raster=None, um_per_arcsec=593.336,
+                  band_limited=True, device=None, **kwargs):
     """BabinetImageOptic from PyFLIP's mask files, with the spot optionally replaced by a mask raster.
 
     Parameters
@@ -490,6 +498,8 @@ def make_occulter(fpm, wavelengths, d_pupil, n_pupil, mount=True, fpm_raster=Non
         Mask raster file replacing the spot (see load_raster_region).
     um_per_arcsec : float, optional
         Mask scale on the sky for the raster [um/arcsec].
+    band_limited : bool, optional
+        Band-limit the raster (see raster_region).
     device : torch.device or str, optional
         Device for the raster's one-time filtering.
     **kwargs
@@ -501,7 +511,7 @@ def make_occulter(fpm, wavelengths, d_pupil, n_pupil, mount=True, fpm_raster=Non
     """
     regions = flip_mask_regions(fpm, spot=fpm_raster is None, mount=mount)
     if fpm_raster is not None:
-        regions.append(load_raster_region(fpm_raster, um_per_arcsec, wavelengths, d_pupil, n_pupil, device))
+        regions.append(load_raster_region(fpm_raster, um_per_arcsec, wavelengths, d_pupil, n_pupil, band_limited, device))
     return BabinetImageOptic(regions, **kwargs)
 
 
