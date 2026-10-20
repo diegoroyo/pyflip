@@ -18,10 +18,19 @@ def _chirps(n_in, n_out, n_fft, device, dtype):
     return chirp_in, chirp_out, h_fft
 
 
-@lru_cache(maxsize=32)
-def _fixed_chirps(n_in, n_out, n_fft, device, dtype):
-    """Retrieve cached chirps for fixed input and output sampling."""
-    return _chirps(n_in, n_out, n_fft, device, dtype)
+def _axis_factors(n_in, n_out, n_fft, inverse, centre_in, centre_out, device, dtype):
+    """Input factor, output factor and kernel FFT for one axis, window centres included."""
+    sign = -1 if inverse else 1
+    chirp_in, chirp_out, h_fft = _chirps(n_in, n_out, -sign * n_fft, device, dtype)
+    x = torch.arange(n_in, device=device, dtype=torch.float64) - (n_in - 1) / 2
+    u = torch.arange(n_out, device=device, dtype=torch.float64) - (n_out - 1) / 2
+    # A shifted window is a linear phase on the other grid.
+    ramp_in = torch.exp(sign * 2j * torch.pi * centre_out * x / n_fft).to(dtype)
+    ramp_out = torch.exp(sign * 2j * torch.pi * centre_in * (u + centre_out) / n_fft).to(dtype)
+    return chirp_in * ramp_in, chirp_out * ramp_out, h_fft
+
+
+_fixed_axis_factors = lru_cache(maxsize=64)(_axis_factors)
 
 
 def bluestein_fft(field, n_out, n_fft, inverse=False, centre_in=(0., 0.), centre_out=(0., 0.)):
@@ -49,36 +58,23 @@ def bluestein_fft(field, n_out, n_fft, inverse=False, centre_in=(0., 0.), centre
 
     Notes
     -----
-    Coordinates are centred on (n - 1)/2 plus the window centre. The equivalent
-    zero-padded array is not allocated. Chirps are cached for fixed sampling
-    and recalculated when gradients through the sampling are required.
+    Coordinates are centred on (n - 1)/2 plus the window centre. The transform runs
+    along x and then y, each axis cropped to its output before the next. The
+    equivalent zero-padded array is not allocated. Chirps are cached for fixed
+    sampling and recalculated when gradients through the sampling are required.
     """
-    n_in = tuple(field.shape[-2:])
     n_out = (n_out, n_out) if isinstance(n_out, int) else tuple(n_out)
-    scale = (-1 if inverse else 1) / n_fft
-    # A shifted window is a linear phase on the other grid.
-    if any(centre_out):
-        field = field * _linear_phase(n_in, centre_out, scale, field)
-    n_fft = n_fft if inverse else -n_fft
-    if torch.is_tensor(n_fft) and n_fft.requires_grad:
-        (in_y, out_y, h_y), (in_x, out_x, h_x) = [_chirps(i, o, n_fft, field.device, field.dtype) for i, o in zip(n_in, n_out)]
-    else:
-        (in_y, out_y, h_y), (in_x, out_x, h_x) = [_fixed_chirps(i, o, float(n_fft), field.device, field.dtype)
-                                                  for i, o in zip(n_in, n_out)]
-    field_fft = torch.fft.fft2(field * in_y[:, None] * in_x[None, :], s=(h_y.numel(), h_x.numel()))
-    convolution = torch.fft.ifft2(field_fft * h_y[:, None] * h_x[None, :])
-    result = convolution[..., n_in[0] - 1:n_in[0] - 1 + n_out[0], n_in[1] - 1:n_in[1] - 1 + n_out[1]]
-    result = result * out_y[:, None] * out_x[None, :]
-    if any(centre_in):
-        result = result * _linear_phase(n_out, centre_in, scale, field, centre_out)
-    return result
-
-
-def _linear_phase(shape, slope, scale, like, origin=(0., 0.)):
-    """exp(2 pi i scale (slope_y (y + origin_y) + slope_x (x + origin_x))) on a centred grid of the given shape."""
-    y, x = [torch.arange(n, device=like.device, dtype=torch.float64) - (n - 1) / 2 for n in shape]
-    phase = slope[0] * (y[:, None] + origin[0]) + slope[1] * (x[None, :] + origin[1])
-    return torch.exp(2j * torch.pi * scale * phase).to(like.dtype)
+    trainable = torch.is_tensor(n_fft) and n_fft.requires_grad
+    factors = _axis_factors if trainable else _fixed_axis_factors
+    n_fft = n_fft if trainable else float(n_fft)
+    for dim, axis in ((-1, 1), (-2, 0)):
+        field = field.movedim(dim, -1)
+        n_in = field.shape[-1]
+        factor_in, factor_out, h_fft = factors(n_in, n_out[axis], n_fft, inverse, float(centre_in[axis]),
+                                               float(centre_out[axis]), field.device, field.dtype)
+        convolution = torch.fft.ifft(torch.fft.fft(field * factor_in, n=h_fft.numel()) * h_fft)
+        field = (convolution[..., n_in - 1:n_in - 1 + n_out[axis]] * factor_out).movedim(-1, dim)
+    return field
 
 
 def centered_fft(field, inverse=False):
