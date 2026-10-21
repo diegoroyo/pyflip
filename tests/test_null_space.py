@@ -1,11 +1,12 @@
 """Null-space walk on a linear model and on a small Fraunhofer imaging system."""
 import os
 import sys
+import numpy as np
 import torch
+from scipy.sparse.linalg import LinearOperator, cg
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'experiments'))
-from null_space_walk import (null_space_walk, nuisance_projector, jacobian_products, conjugate_gradient,
-                             nystrom_preconditioner)
+from null_space_walk import null_space_walk, nuisance_projector, jacobian_products, nystrom_preconditioner
 
 
 def test_jacobian_products_match_full_jacobian():
@@ -22,19 +23,22 @@ def test_jacobian_products_match_full_jacobian():
 
 
 def test_nystrom_preconditioner_speeds_up_conjugate_gradients():
-    """A Nystrom preconditioner covering the eigenvalues above delta cuts the CG iterations, same solution."""
+    """A Nystrom preconditioner covering the eigenvalues above delta cuts scipy's CG iterations, same solution."""
     torch.manual_seed(2)
     m, delta = 200, 1e-6
     Q = torch.linalg.qr(torch.randn(m, m, dtype=torch.float64))[0]
     K = Q @ torch.diag(10.0**torch.linspace(4, -10, m, dtype=torch.float64)) @ Q.T
-    apply_A = lambda x: K @ x + delta * x
-    b = torch.randn(m, dtype=torch.float64)
-    exact = torch.linalg.solve(K + delta * torch.eye(m, dtype=torch.float64), b)
-    _, n_plain, _ = conjugate_gradient(apply_A, b, 500, 1e-8)
-    x, n_pre, rel = conjugate_gradient(apply_A, b, 500, 1e-8, nystrom_preconditioner(lambda x: K @ x, m, 160, delta))
-    assert n_pre < n_plain / 10
-    assert rel <= 1e-8
-    torch.testing.assert_close(x, exact, rtol=1e-6, atol=1e-6 * float(exact.norm()))
+    A = (K + delta * torch.eye(m, dtype=torch.float64)).numpy()
+    b = torch.randn(m, dtype=torch.float64).numpy()
+    apply_Minv = nystrom_preconditioner(lambda x: K @ x, m, 160, delta, torch.zeros(m, dtype=torch.float64))
+    M = LinearOperator((m, m), matvec=lambda x: apply_Minv(torch.as_tensor(x)).numpy())
+    iterations = {}
+    for name, preconditioner in (('plain', None), ('nystrom', M)):
+        count = [0]
+        x, _ = cg(A, b, rtol=1e-8, maxiter=500, M=preconditioner, callback=lambda _: count.__setitem__(0, count[0] + 1))
+        iterations[name] = count[0]
+    assert iterations['nystrom'] < iterations['plain'] / 10
+    np.testing.assert_allclose(x, np.linalg.solve(A, b), rtol=1e-6, atol=1e-6 * np.linalg.norm(np.linalg.solve(A, b)))
 
 
 def test_full_step_on_linear_model_reaches_minimum_norm_solution():

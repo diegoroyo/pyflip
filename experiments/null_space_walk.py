@@ -1,61 +1,33 @@
 """Null-space walk of fitted PyFLIP OPD maps.
 
 A fitted pupil (JWSTPrimary) or Lyot-plane (NIRCamLyotstop) OPD map is not unique: many maps
-give the same detector images, and an optimiser leaves an arbitrary part of the map in
+give the same detector image, and an optimiser leaves an arbitrary part of the map in
 directions the data cannot see. The walk removes that part step by step while the model's
-images of the given frames stay unchanged (star position and flux are free nuisances) and
-each frame keeps its share of the light after the Lyot stop inside the detector window, so
-the walk cannot hide starlight outside the window. What is left is the part of the maps the
-images need.
+image stays unchanged (star position and flux are free) and the detector window keeps its
+share of the light after the Lyot stop, so starlight cannot be hidden outside the window.
 
 USAGE
 
-1. From a state saved by flip_stages_fixed_geometry.py (fitted_reference.npz or
-   fitted_final.npz: maps, flat field, star, flux, geometry and the options that rebuild the
-   model):
+    python null_space_walk.py --state fitted_reference.npz --steps 30
 
-       python null_space_walk.py --state fitted_reference.npz --steps 30
+        a state saved by flip_stages_fixed_geometry.py (maps, flat field, star, flux, geometry
+        and the options that rebuild its model);
 
-2. From PyFLIP's own fitted maps (.npy, metres, 1024 x 1024; any leading axes of length 1
-   are dropped), with the model directory and the data frame they were fitted to:
+    python null_space_walk.py --pupil_map pupil.npy --lyot_map lyot.npy --model_dir <dir> \\
+        --data <calints.fits> --px_mask pixel_masks.npy [--star_mas x,y] --steps 30
 
-       python null_space_walk.py --pupil_map pupil_opd.npy --lyot_map lyot_opd.npy \\
-           --model_dir HIP65426/model_setup_newpath --data ref_calints.fits \\
-           --px_mask pixel_masks.npy --star_mas 12.3,-4.1 --steps 30
-
-   Without --star_mas the star position is fitted to the data first (Gauss-Newton); the
-   flux is always solved by least squares. The model is PyFLIP's assemble_JWST_NIRCam_coron:
-   its mask files and Lyot stop as stored, unless --fpm_raster / --no_mount / --lyot_file
-   and the geometry options (--registration, --blur, --lyot_shift, --clocking, --fpm_dz)
-   say otherwise. --flat gives a fitted detector flat field.
-
-   --frames adds further data frames (e.g. other dithers) whose images are kept as well;
-   their star positions are fitted first.
-
-Run from refactoring/ or anywhere (the modules are found relative to this file); a GPU is
-used when there is one (--device). Data frames are PyFLIP's calints FITS files or its
-coadded .npy frames (see dl_utils.load_and_crop_data).
+        maps fitted with PyFLIP's default model of a model directory (.npy, metres); without
+        --star_mas the star position is fitted to the data first.
 
 OUTPUT
 
-<out>.npz in the state format (walked maps, star and flux refitted to the start images,
-the other fields as given) and <out>.log, one line per trial step:
-
-    step 7 a 0.050: maps 212.4 nm RMS, invisible 141.3 nm, image change 23.1 (budget 113), window share 0.998,
-        chi2/N 0.741 (start 0.733), CG 61 it, 4.2 s
-
-  - maps: RMS of the walked maps over their supports (pupil and Lyot stop openings, together).
-  - invisible: RMS of the part of the maps the frames do not see (removed a fraction at a time).
-  - image change: sum over the frames' pixels of ((image - start image) / noise)^2, star and
-    flux free; a step is accepted while it stays within the budget (default sqrt(2 N) for
-    N pixels: well inside the noise of a chi^2 over N pixels).
-  - window share: detector-window light over post-stop light, relative to the start.
-  - chi2/N: noise-weighted chi^2 per pixel of the model against the data, flux fitted.
-
-The walk stops after --steps accepted steps, or when even a step of 1/64 of
---step_fraction leaves the budget. If the log's CG residual grows well above 1e-3, the
-invisible part is no longer computed accurately and the maps stop shrinking: raise --rank
-or --n_iter.
+<out>.npz with the walked maps (same fields as --state; star and flux refitted to the start
+image) and <out>.log, one line per trial step: map RMS over the pupil and stop openings, RMS
+of the part removed a fraction at a time (invisible), image change sum(((image - start) /
+noise)^2) against the budget (default sqrt(2 N) for N pixels), window share relative to the
+start, and chi^2/N against the data. If the conjugate-gradient residual grows well above the
+tolerance the invisible part is inaccurate and the maps stop shrinking: raise --rank or
+--n_iter.
 """
 import argparse
 import json
@@ -65,299 +37,173 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.optimize import least_squares
+from scipy.sparse.linalg import LinearOperator, cg
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'refactoring'))
 
+MAS = np.radians(1 / 3.6e6)                                   # [rad]
 
-#### WALK (model-independent)
+
+#### WALK
 def jacobian_products(residual, theta):
-    """Residual and Jacobian products of a residual function at one parameter vector.
+    """Residual and Jacobian products of a residual function, from reverse mode only.
 
     Parameters
     ----------
     residual : callable
-        Map from a parameter vector, shape (n,), to a residual vector, shape (m,).
+        Parameters, shape (n,) -> residual, shape (m,).
     theta : torch.Tensor
-        Parameter vector, shape (n,).
+        Parameters, shape (n,).
 
     Returns
     -------
     r : torch.Tensor
-        Residual at theta, shape (m,).
-    jvp : callable
-        v -> J v, with J the Jacobian of residual at theta.
-    vjp : callable
-        u -> J^T u.
-
-    Notes
-    -----
-    J v is the vector-Jacobian product of the linear map u -> J^T u, so only reverse-mode
-    derivatives of the residual are needed.
+        Residual at theta.
+    jvp, vjp : callable
+        v -> J v and u -> J^T u at theta.
     """
     r, vjp_fn = torch.func.vjp(residual, theta)
-    transpose = lambda u: vjp_fn(u)[0]
-    jvp = lambda v: torch.func.vjp(transpose, torch.zeros_like(r))[1](v)[0].detach()
-    return r.detach(), jvp, lambda u: transpose(u).detach()
+    vjp = lambda u: vjp_fn(u)[0]
+    jvp = lambda v: torch.func.vjp(vjp, torch.zeros_like(r))[1](v)[0].detach()
+    return r.detach(), jvp, lambda u: vjp(u).detach()
 
 
 def nuisance_projector(columns):
-    """Orthogonal projector removing the span of nuisance columns.
-
-    Parameters
-    ----------
-    columns : torch.Tensor or None
-        Residual derivatives along the nuisance parameters, shape (m, k).
-
-    Returns
-    -------
-    callable
-        u -> u - Q Q^T u, with Q an orthonormal basis of the columns.
-    """
-    if columns is None or columns.shape[1] == 0:
-        return lambda u: u
+    """u -> u - Q Q^T u, with Q an orthonormal basis of the residual derivatives along the nuisances, shape (m, k)."""
     q = torch.linalg.qr(columns)[0]
     return lambda u: u - q @ (q.T @ u)
 
 
-def conjugate_gradient(apply_A, b, n_iter, tol, apply_Minv=None):
-    """Solve A x = b for a symmetric positive-definite A by preconditioned conjugate gradients.
-
-    Parameters
-    ----------
-    apply_A : callable
-        x -> A x.
-    b : torch.Tensor
-        Right-hand side, shape (m,).
-    n_iter : int
-        Maximum number of iterations.
-    tol : float
-        Stop when ||b - A x|| <= tol ||b||.
-    apply_Minv : callable, optional
-        x -> M^-1 x for a symmetric positive-definite preconditioner M; None uses none.
-
-    Returns
-    -------
-    x : torch.Tensor
-        Solution, shape (m,).
-    n : int
-        Number of iterations.
-    rel : float
-        Final relative residual norm.
-    """
-    x = torch.zeros_like(b)
-    b_norm = float(b.norm())
-    if b_norm == 0:
-        return x, 0, 0.
-    apply_Minv = apply_Minv or (lambda v: v)
-    r = b.clone()
-    z = apply_Minv(r)
-    d = z.clone()
-    rz = r @ z
-    for n in range(1, n_iter + 1):
-        Ad = apply_A(d)
-        alpha = rz / (d @ Ad)
-        x = x + alpha * d
-        r = r - alpha * Ad
-        if float(r.norm()) <= tol * b_norm:
-            break
-        z = apply_Minv(r)
-        rz_new = r @ z
-        d = z + (rz_new / rz) * d
-        rz = rz_new
-    return x, n, float(r.norm()) / b_norm
-
-
-def nystrom_preconditioner(apply_K, m, rank, delta, dtype=torch.float64, device=None):
-    """Randomized Nystrom preconditioner for K + delta I, with K symmetric positive semi-definite.
+def nystrom_preconditioner(apply_K, m, rank, delta, like):
+    """Randomized Nystrom preconditioner of K + delta I, K symmetric positive semi-definite.
 
     Parameters
     ----------
     apply_K : callable
-        x -> K x, for x of shape (m,).
-    m : int
-        Size of K.
-    rank : int
-        Number of products with K, the rank of the approximation.
+        x -> K x, shape (m,).
+    m, rank : int
+        Size of K and rank of the approximation.
     delta : float
-        Shift of the system the preconditioner is for.
-    dtype : torch.dtype, optional
-        Real dtype of the vectors.
-    device : torch.device or str, optional
-        Device of the vectors.
+        Shift.
+    like : torch.Tensor
+        Gives the dtype and device.
 
     Returns
     -------
     callable
-        x -> P^-1 x, with P^-1 = (lam_k + delta) U (Lam + delta I)^-1 U^T + (I - U U^T) for the
-        rank-k approximation U Lam U^T of K.
+        x -> P^-1 x = (lam_k + delta) U (Lam + delta I)^-1 U^T x + (I - U U^T) x.
 
     Notes
     -----
     Frangella, Tropp and Udell, SIAM J. Matrix Anal. Appl. 44, 718 (2023).
     """
-    omega = torch.linalg.qr(torch.randn(m, rank, dtype=dtype, device=device))[0]
+    omega = torch.linalg.qr(torch.randn(m, rank, dtype=like.dtype, device=like.device))[0]
     Y = torch.stack([apply_K(omega[:, j]) for j in range(rank)], 1)
-    nu = torch.finfo(dtype).eps * m**0.5 * float(Y.norm())
+    nu = torch.finfo(like.dtype).eps * m**0.5 * float(Y.norm())
     Y = Y + nu * omega
-    L = torch.linalg.cholesky(omega.T @ Y)
-    B = torch.linalg.solve_triangular(L, Y.T, upper=False).T
+    B = torch.linalg.solve_triangular(torch.linalg.cholesky(omega.T @ Y), Y.T, upper=False).T
     U, sv, _ = torch.linalg.svd(B, full_matrices=False)
     lam = torch.clamp(sv**2 - nu, min=0.)
     scale = (lam[-1] + delta) / (lam + delta)
-
-    def apply(x):
-        c = U.T @ x
-        return U @ (scale * c) + (x - U @ c)
-    return apply
+    return lambda x: U @ (scale * (U.T @ x)) + x - U @ (U.T @ x)
 
 
-def minimum_norm_change(jvp, vjp, project, support, b, delta, n_iter=1000, tol=1e-3, apply_Minv=None):
-    """Smallest supported parameter change whose first-order residual change is b.
+def minimum_norm_change(jvp, vjp, project, support, b, delta, n_iter, tol, apply_Minv=None):
+    """Smallest supported parameter change whose first-order projected residual change is b.
 
-    Parameters
-    ----------
-    jvp, vjp : callable
-        Jacobian products at the current parameters (see jacobian_products).
-    project : callable
-        Projector removing the nuisance directions from a residual vector.
-    support : torch.Tensor
-        1 on the parameters that may change, 0 elsewhere, shape (n,).
-    b : torch.Tensor
-        Residual change, shape (m,).
-    delta : float
-        Tikhonov parameter; directions with squared singular value below it count as invisible.
-    n_iter : int, optional
-        Maximum number of conjugate-gradient iterations.
-    tol : float, optional
-        Relative tolerance of the conjugate-gradient solve.
-    apply_Minv : callable, optional
-        Preconditioner of W J S J^T W + delta I (see nystrom_preconditioner).
-
-    Returns
-    -------
-    dtheta : torch.Tensor
-        Parameter change, shape (n,).
-    n : int
-        Number of conjugate-gradient iterations.
-    rel : float
-        Final relative residual of the solve.
-
-    Notes
-    -----
-    dtheta = S J^T W y with (W J S J^T W + delta I) y = W b, where S is the support and W the projector.
+    dtheta = S J^T W y with (W J S J^T W + delta I) y = W b, for the support S and the nuisance
+    projector W, solved by scipy's conjugate gradients. Directions with squared singular value
+    below delta count as invisible. Returns dtheta, the iterations and the final relative residual.
     """
-    apply_A = lambda y: project(jvp(support * vjp(project(y)))) + delta * y
-    y, n, rel = conjugate_gradient(apply_A, project(b), n_iter, tol, apply_Minv)
-    return support * vjp(project(y)), n, rel
+    to_torch = lambda x: torch.as_tensor(x, dtype=b.dtype, device=b.device)
+    numpy_op = lambda f: (lambda x: f(to_torch(x)).cpu().numpy())
+    A = LinearOperator((len(b), len(b)), matvec=numpy_op(lambda y: project(jvp(support * vjp(project(y)))) + delta * y))
+    M = None if apply_Minv is None else LinearOperator((len(b), len(b)), matvec=numpy_op(apply_Minv))
+    rhs = project(b).cpu().numpy()
+    iterations = [0]
+    y, _ = cg(A, rhs, rtol=tol, maxiter=n_iter, M=M, callback=lambda _: iterations.__setitem__(0, iterations[0] + 1))
+    rel = np.linalg.norm(rhs - A @ y) / max(np.linalg.norm(rhs), 1e-300)
+    return support * vjp(project(to_torch(y))), iterations[0], rel
 
 
 def null_space_walk(residual, nuisance_columns, theta, support, steps, delta, budget, step_fraction=0.1,
-                    retractions=4, retraction_delta=None, n_iter=1000, tol=1e-3, rank=0, report=None):
-    """Remove the invisible part of the supported parameters while the residual stays near zero.
+                    retractions=4, n_iter=300, tol=1e-3, rank=0, report=None):
+    """Remove the invisible part of the supported parameters while the projected residual stays within budget.
 
     Parameters
     ----------
     residual : callable
-        Map from parameters, shape (n,), to the residual from the start state, shape (m,);
-        zero at the start.
-    nuisance_columns : callable or None
-        Map from parameters to residual derivatives along the nuisance parameters, shape (m, k).
-    theta : torch.Tensor
-        Start parameters, shape (n,).
-    support : torch.Tensor
-        1 on the parameters that are walked, 0 elsewhere, shape (n,).
+        Parameters, shape (n,) -> residual from the start state, shape (m,); zero at the start.
+    nuisance_columns : callable
+        Parameters -> residual derivatives along the nuisance parameters, shape (m, k).
+    theta, support : torch.Tensor
+        Start parameters, and 1 on those walked, 0 elsewhere, shape (n,).
     steps : int
-        Number of accepted steps.
+        Accepted steps.
     delta : float
-        Tikhonov parameter that separates the invisible part (see minimum_norm_change).
+        Tikhonov parameter separating the invisible part.
     budget : float
         Largest squared norm of the projected residual of an accepted state.
     step_fraction : float, optional
         Largest fraction of the invisible part removed in one step.
     retractions : int, optional
-        Gauss-Newton steps that pull each trial back to zero residual.
-    retraction_delta : float, optional
-        Tikhonov parameter of the retraction solves; None uses delta.
+        Gauss-Newton steps pulling each trial back towards the start residual.
     n_iter, tol : optional
         Conjugate-gradient iteration limit and relative tolerance.
     rank : int, optional
-        Rank of a Nystrom preconditioner of the invisible-part solves, built at the start and
-        rebuilt at the current accepted parameters when a solve there misses the tolerance; 0
-        uses none.
+        Rank of the Nystrom preconditioner, rebuilt when a solve misses tol; 0: none.
     report : callable, optional
         Called after each trial with (accepted, trial parameters, info dict).
 
     Returns
     -------
     theta : torch.Tensor
-        Walked parameters, shape (n,).
+        Walked parameters.
     history : list of dict
-        Per accepted step: step fraction, norm of the supported parameters, norm of their invisible
-        part, squared projected residual after retraction, the largest number of conjugate-gradient
-        iterations and relative residual, wall time [s].
-
-    Notes
-    -----
-    Each step removes a fraction of the invisible part at the current parameters, then pulls the
-    residual (always measured from the start state) back towards zero with the Jacobian at the
-    trial parameters, so residual left by earlier steps is corrected too. What the retraction
-    cannot correct are directions below delta; removing an invisible part of norm v costs at most
-    delta v^2, so delta <= budget / v^2 keeps the walk within its budget.
+        Info of the accepted steps.
     """
-    retraction_delta = delta if retraction_delta is None else retraction_delta
-
     def linearise(t):
         r, jvp, vjp = jacobian_products(residual, t)
-        project = nuisance_projector(None if nuisance_columns is None else nuisance_columns(t))
+        project = nuisance_projector(nuisance_columns(t))
         return project(r), jvp, vjp, project
 
-    def cost_at(t, project):
+    def cost(t, project):
         with torch.no_grad():
             r = project(residual(t))
         return float(r @ r)
 
-    preconditioner = [None, 0]
-
-    def build(jvp, vjp, project, m, dtype, device):
-        apply_K = lambda y: project(jvp(support * vjp(project(y))))
-        preconditioner[0] = nystrom_preconditioner(apply_K, m, rank, delta, dtype, device)
-        preconditioner[1] += 1
+    def preconditioner(jvp, vjp, project, r):
+        if not rank:
+            return None
+        return nystrom_preconditioner(lambda y: project(jvp(support * vjp(project(y)))), len(r), rank, delta, r)
 
     history, a = [], step_fraction
     r, jvp, vjp, project = linearise(theta)
-    if rank:
-        build(jvp, vjp, project, len(r), r.dtype, r.device)
+    Minv = preconditioner(jvp, vjp, project, r)
     while len(history) < steps and a > step_fraction / 64:
-        t0, cg, cg_rel = time.time(), [], []
+        t0 = time.time()
         s = support * theta
-        visible, n, rel = minimum_norm_change(jvp, vjp, project, support, jvp(s), delta, n_iter, tol, preconditioner[0])
+        visible, n, rel = minimum_norm_change(jvp, vjp, project, support, jvp(s), delta, n_iter, tol, Minv)
         if rank and rel > tol:
-            build(jvp, vjp, project, len(r), r.dtype, r.device)
-            visible, n, rel = minimum_norm_change(jvp, vjp, project, support, jvp(s), delta, n_iter, tol, preconditioner[0])
-        cg.append(n)
-        cg_rel.append(rel)
+            Minv = preconditioner(jvp, vjp, project, r)
+            visible, n, rel = minimum_norm_change(jvp, vjp, project, support, jvp(s), delta, n_iter, tol, Minv)
         invisible = s - visible
         trial = theta - a * invisible
         r_t, jvp_t, vjp_t, project_t = linearise(trial)
         for _ in range(retractions):
-            dtheta, n, rel = minimum_norm_change(jvp_t, vjp_t, project_t, support, r_t, retraction_delta, n_iter, tol,
-                                                 preconditioner[0])
-            cg.append(n)
-            cg_rel.append(rel)
+            dtheta, _, _ = minimum_norm_change(jvp_t, vjp_t, project_t, support, r_t, delta, n_iter, tol, Minv)
             current = float(r_t @ r_t)
-            for c in (1., 0.5, 0.25, 0.1):
-                if cost_at(trial - c * dtheta, project_t) < current:
-                    break
-            else:
+            damping = next((c for c in (1., 0.5, 0.25, 0.1) if cost(trial - c * dtheta, project_t) < current), None)
+            if damping is None:
                 break
-            trial = trial - c * dtheta
+            trial = trial - damping * dtheta
             r_t, jvp_t, vjp_t, project_t = linearise(trial)
-        cost = float(r_t @ r_t)
-        accept = cost <= budget
-        info = dict(step_fraction=a, norm=float((support * trial).norm()), invisible=float(invisible.norm()), cost=cost,
-                    cg=max(cg), cg_residual=max(cg_rel), time=time.time() - t0)
+        info = dict(step_fraction=a, invisible=float(invisible.norm()), cost=float(r_t @ r_t), cg=n, cg_residual=rel,
+                    time=time.time() - t0)
+        accepted = info['cost'] <= budget
         if report is not None:
-            report(accept, trial, info)
-        if accept:
+            report(accepted, trial, info)
+        if accepted:
             theta, r, jvp, vjp, project = trial, r_t, jvp_t, vjp_t, project_t
             history.append(info)
             a = min(step_fraction, 1.5 * a)
@@ -367,122 +213,79 @@ def null_space_walk(residual, nuisance_columns, theta, support, steps, delta, bu
 
 
 #### PYFLIP MODEL
-WF_NPIX, DIAMETER = 1024, 6.603464
 PUPIL = 'instrument.optical_system.JWSTPrimary.wfe_offsets.grid'
 LYOT = 'instrument.optical_system.NIRCamLyotstop.wfe_offsets.grid'
 STAR = 'wavefront.angles_offset'
 
 
-def read_map(path):
-    """A fitted OPD map [m] from a .npy file, leading axes of length 1 dropped."""
-    m = np.load(path).astype(np.float64)
-    return m.reshape(m.shape[-2:])
-
-
 def state_from_args(args):
-    """Fitted state from --state, or from PyFLIP map files and the options given."""
+    """Fitted state from --state, or from PyFLIP map files with the model directory's default model."""
     if args.state:
         z = np.load(args.state)
         state = {k: z[k] for k in z.files if k != 'options'}
         state['options'] = json.loads(str(z['options']))
         return state
-    options = dict(model_dir=args.model_dir, data_file=args.data, px_mask=args.px_mask, num_det_px=args.num_det_px, oversample=2,
-                   fpm_raster=args.fpm_raster, um_per_arcsec=args.um_per_arcsec, band_limited=not args.full_raster,
-                   square_cells=args.square_cells, mount=not args.no_mount, lyot_file=args.lyot_file, fpm_focal_length=131.4,
-                   substrate=not args.no_substrate)
-    star = None if args.star_mas is None else np.radians(np.array([float(v) for v in args.star_mas.split(',')]) / 3.6e6)
-    return dict(pupil=read_map(args.pupil_map), lyot=read_map(args.lyot_map),
-                flat=None if args.flat is None else np.squeeze(np.load(args.flat)), star=star, flux=None,
-                registration=None if args.registration is None else np.array([float(v) for v in args.registration.split(',')]),
-                blur=args.blur, lyot_shift=np.array([float(v) for v in args.lyot_shift.split(',')]), clocking=args.clocking,
-                fpm_dz=1e-3 * args.fpm_dz, options=options)
+    read_map = lambda path: np.load(path).astype(np.float64).reshape(1024, 1024)
+    star = None if args.star_mas is None else MAS * np.array([float(v) for v in args.star_mas.split(',')])
+    options = dict(model_dir=args.model_dir, data_file=args.data, px_mask=args.px_mask, num_det_px=args.num_det_px)
+    return dict(pupil=read_map(args.pupil_map), lyot=read_map(args.lyot_map), star=star, options=options)
 
 
 def build_model(state, device):
-    """PyFLIP instrument and wavefront for a fitted state (maps and star are set by the walk)."""
+    """PyFLIP instrument and wavefront of a fitted state; the maps and the star are set at each call."""
     from wavefronts import BroadbandWavefront
     from model_building import assemble_JWST_NIRCam_coron
     from dl_utils import load_model_data
     o = state['options']
     _, _, _, _, wlen_weights, _ = load_model_data(o['model_dir'], substrate=o.get('substrate', True))
-    babinet = o.get('fpm_raster') is not None or not o.get('mount', True)
-    instrument = assemble_JWST_NIRCam_coron(o['model_dir'], o['num_det_px'], DEVICE=device, oversample=o.get('oversample', 2),
-                                            babinet=babinet, mount=o.get('mount', True), fpm_raster=o.get('fpm_raster'),
+    instrument = assemble_JWST_NIRCam_coron(o['model_dir'], o['num_det_px'], DEVICE=device,
+                                            babinet=o.get('fpm_raster') is not None or not o.get('mount', True),
+                                            mount=o.get('mount', True), fpm_raster=o.get('fpm_raster'),
                                             um_per_arcsec=o.get('um_per_arcsec') or 593.336, band_limited=o.get('band_limited', True),
                                             square_cells=o.get('square_cells', False),
-                                            fpm_axial_offset=float(state.get('fpm_dz', 0.)) or None,
-                                            fpm_focal_length=o.get('fpm_focal_length', 131.4))
-    system = instrument.optical_system
-    lyot = system.NIRCamLyotstop
+                                            fpm_axial_offset=float(state.get('fpm_dz', 0.)) or None, fpm_focal_length=131.4)
+    lyot, detector = instrument.optical_system.NIRCamLyotstop, instrument.optical_system.NIRCamdetector
     if o.get('lyot_file'):
         lyot.amplitude = torch.FloatTensor(np.load(o['lyot_file'])).to(device)[None]
-    detector = system.NIRCamdetector
     if state.get('registration') is not None:
         detector.subpixel_shift.shift_x, detector.subpixel_shift.shift_y = (float(v) for v in state['registration'])
     with torch.no_grad():
-        lyot.pupil_shifts.x_shift.fill_(float(state['lyot_shift'][0]))
-        lyot.pupil_shifts.y_shift.fill_(float(state['lyot_shift'][1]))
-        lyot.pupil_shifts.rotation.fill_(float(state['clocking']))
+        if state.get('lyot_shift') is not None:
+            lyot.pupil_shifts.x_shift.fill_(float(state['lyot_shift'][0]))
+            lyot.pupil_shifts.y_shift.fill_(float(state['lyot_shift'][1]))
+            lyot.pupil_shifts.rotation.fill_(float(state['clocking']))
         if state.get('blur') is not None:
-            detector.charge_diffusion.log_sigma.fill_(np.log(float(state['blur']) * o.get('oversample', 2)))
+            detector.charge_diffusion.log_sigma.fill_(np.log(2 * float(state['blur'])))
         if state.get('flat') is not None:
             detector.detector_flat_field.grid.copy_(torch.as_tensor(state['flat']).reshape(detector.detector_flat_field.grid.shape))
-    wavefront = BroadbandWavefront(WF_NPIX, DIAMETER, wlen_weights, torch.ones(1, dtype=torch.float64),
+    wavefront = BroadbandWavefront(1024, 6.603464, wlen_weights, torch.ones(1, dtype=torch.float64),
                                    angles_offset=torch.zeros(2, dtype=torch.float64), DEVICE=device).to(device)
-    for parameter in list(instrument.parameters()) + list(wavefront.parameters()):
-        parameter.requires_grad_(False)
-    module = nn.ModuleDict({'instrument': instrument, 'wavefront': wavefront})
+    module = nn.ModuleDict({'instrument': instrument, 'wavefront': wavefront}).requires_grad_(False)
     module.forward = lambda: instrument(wavefront)
     return module
 
 
-def load_frame(path, options, device):
-    """Data, noise and the used pixels of one frame, flattened to those pixels."""
+def load_frame(options, device):
+    """Data and noise on the used pixels, and those pixels' flat indices."""
     from dl_utils import load_and_crop_data
-    data, noise = (np.squeeze(a).astype(np.float64) for a in load_and_crop_data(path, num_det_px=options['num_det_px'], coron_type='MASK335R'))
+    data, noise = (np.squeeze(a).astype(np.float64) for a in load_and_crop_data(options['data_file'],
+                                                                               num_det_px=options['num_det_px']))
     good = np.isfinite(data) & np.isfinite(noise) & (noise > 0)
     if options.get('px_mask'):
         good &= np.squeeze(np.load(options['px_mask'])) > 0
     pixels = torch.as_tensor(np.flatnonzero(good), device=device)
-    return (torch.as_tensor(data, device=device).reshape(-1)[pixels], torch.as_tensor(noise, device=device).reshape(-1)[pixels], pixels)
+    return (torch.as_tensor(data, device=device).reshape(-1)[pixels], torch.as_tensor(noise, device=device).reshape(-1)[pixels],
+            pixels)
 
 
-def least_squares_flux(image, target, noise):
-    """Flux that minimises sum(((flux * image - target) / noise)^2)."""
-    return float((image * target / noise**2).sum() / (image**2 / noise**2).sum())
-
-
-def fit_star(image_of, star, target, noise, steps=6, h=np.radians(5e-4 / 3600)):
-    """Star offset and flux that fit a model image to a target image, by Gauss-Newton.
-
-    Parameters
-    ----------
-    image_of : callable
-        Star offset [rad], shape (2,) -> model image on the used pixels.
-    star : torch.Tensor
-        Start offset [rad], shape (2,).
-    target, noise : torch.Tensor
-        Target image and its noise on the used pixels.
-    steps : int, optional
-        Gauss-Newton steps.
-    h : float, optional
-        Finite-difference step [rad].
-
-    Returns
-    -------
-    star : torch.Tensor
-        Fitted offset [rad].
-    flux : float
-        Least-squares flux at the fitted offset.
-    """
-    def r_of(s):
-        image = image_of(s)
-        return (least_squares_flux(image, target, noise) * image - target) / noise
-    for _ in range(steps):
-        r = r_of(star)
-        J = torch.stack([(r_of(star + h * e) - r) / h for e in torch.eye(2, dtype=star.dtype, device=star.device)], 1)
-        star = star + torch.linalg.lstsq(J, -r[:, None]).solution[:, 0]
-    return star, least_squares_flux(image_of(star), target, noise)
+def fit_star(image_of, star, target, noise):
+    """Star offset [rad] fitted by least squares to a target image, the flux solved at each offset; returns star, flux."""
+    def flux_and_residual(star_mas):
+        image = image_of(torch.as_tensor(star_mas * MAS, dtype=target.dtype, device=target.device))
+        flux = (image * target / noise**2).sum() / (image**2 / noise**2).sum()
+        return float(flux), ((flux * image - target) / noise).cpu().numpy()
+    star_mas = least_squares(lambda s: flux_and_residual(s)[1], np.asarray(star.cpu()) / MAS, diff_step=1e-3).x
+    return torch.as_tensor(star_mas * MAS, dtype=target.dtype, device=target.device), flux_and_residual(star_mas)[0]
 
 
 def parse_args():
@@ -495,30 +298,15 @@ def parse_args():
     parser.add_argument('--px_mask', help='pixel mask (.npy, 1 = used)')
     parser.add_argument('--num_det_px', type=int, default=80, help='detector window [pixels]')
     parser.add_argument('--star_mas', help='fitted star offset x,y [mas]; default: fitted to the data')
-    parser.add_argument('--flat', help='fitted detector flat field (.npy)')
-    parser.add_argument('--registration', help='detector registration x,y [pixels]; default: the model directory\'s')
-    parser.add_argument('--blur', type=float, help='detector blur sigma [pixels]; default: PyFLIP\'s')
-    parser.add_argument('--lyot_shift', default='0,0', help='Lyot stop shift x,y [pupil samples]')
-    parser.add_argument('--clocking', type=float, default=0., help='Lyot stop rotation [deg]')
-    parser.add_argument('--fpm_dz', type=float, default=0., help='focal plane mask axial offset [mm, primary equivalent]')
-    parser.add_argument('--lyot_file', help='Lyot stop transmission replacing the model directory\'s (.npy)')
-    parser.add_argument('--fpm_raster', help='mask raster replacing the spot (see load_raster_region)')
-    parser.add_argument('--um_per_arcsec', type=float, default=593.336, help='raster scale on the sky [um/arcsec]')
-    parser.add_argument('--full_raster', action='store_true', help='every raster cell instead of the band-limited raster')
-    parser.add_argument('--square_cells', action='store_true', help='square raster cells (band-limited raster)')
-    parser.add_argument('--no_mount', action='store_true', help='drop the mask mount regions')
-    parser.add_argument('--no_substrate', action='store_true', help='band weights without the mask substrate transmission')
-    parser.add_argument('--frames', default='', help='further data frames whose images are kept (comma separated)')
     parser.add_argument('--steps', type=int, default=30, help='accepted steps')
     parser.add_argument('--step_fraction', type=float, default=0.1, help='largest fraction of the invisible part removed per step')
     parser.add_argument('--budget', type=float, help='largest image change, sum of ((image - start) / noise)^2; default sqrt(2 N)')
-    parser.add_argument('--delta', type=float, help='image change per (nm RMS)^2 below which a map direction is invisible; '
-                        'default budget / (4 x the squared start map RMS), so removing all of it stays within the budget')
-    parser.add_argument('--share_weight', type=float, default=300., help='weight of the window-share rows: the relative share may '
-                        'change by up to sqrt(budget) / share_weight; 0 does not keep the share')
+    parser.add_argument('--delta', type=float, help='Tikhonov parameter; default budget / (4 x squared start map norm)')
+    parser.add_argument('--share_weight', type=float, default=300., help='weight of the window-share row: the relative share '
+                        'may change by up to sqrt(budget) / share_weight')
     parser.add_argument('--rank', type=int, default=800, help='rank of the Nystrom preconditioner; 0: none')
     parser.add_argument('--n_iter', type=int, default=300, help='conjugate-gradient iterations per solve')
-    parser.add_argument('--out', help='output name without extension; default: <state or pupil map>_walked')
+    parser.add_argument('--out', help='output name without extension; default: <input>_walked')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
     if not args.state and not (args.pupil_map and args.lyot_map and args.model_dir and args.data):
@@ -528,118 +316,87 @@ def parse_args():
 
 def main():
     args = parse_args()
-    device = args.device
     out = args.out or os.path.splitext(args.state or args.pupil_map)[0] + '_walked'
     log = open(out + '.log', 'w')
 
     def say(line):
         print(line, flush=True)
         log.write(line + '\n')
-        log.flush()
-
-    numbers = lambda values: ' '.join('%.4f' % v for v in values)
 
     state = state_from_args(args)
-    options = state['options']
-    module = build_model(state, device)
+    module = build_model(state, args.device)
     system = module['instrument'].optical_system
     post_stop = {}
     system.NIRCamLyotstop.register_forward_hook(lambda m, i, output: post_stop.update(field=output))
-    wl_weights = module['wavefront'].wl_weights
-    files = [options['data_file']] + [f for f in args.frames.split(',') if f]
-    frames = [load_frame(f, options, device) for f in files]
+    data, noise, pixels = load_frame(state['options'], args.device)
 
     shape = system.JWSTPrimary.wfe_offsets.grid.shape
     n_map = int(np.prod(shape))
     support = torch.cat([system.JWSTPrimary.amplitude.reshape(-1) > 0,
                          system.NIRCamLyotstop.transmission().detach().reshape(-1) > 1e-3]).double()
-    unit = 1e-9 * float(support.sum())**0.5                    # theta of norm 1 over the supports: maps of 1 nm RMS [m]
-    theta0 = torch.as_tensor(np.concatenate([np.asarray(state['pupil']).reshape(-1), np.asarray(state['lyot']).reshape(-1)]),
-                             dtype=torch.float64, device=device) / unit
+    unit = 1e-9 * float(support.sum())**0.5                    # a parameter vector of norm 1: maps of 1 nm RMS [m]
+    theta0 = torch.as_tensor(np.concatenate([state['pupil'].reshape(-1), state['lyot'].reshape(-1)]), device=args.device) / unit
 
     def render(theta, star):
-        """Model image on the detector window, and the window share of the post-stop light."""
+        """Model image on the used pixels, and the window share of the post-stop light."""
         params = {PUPIL: (unit * theta[:n_map]).reshape(shape), LYOT: (unit * theta[n_map:]).reshape(shape), STAR: star}
         image = torch.func.functional_call(module, params, ()).reshape(-1)
-        energy = (post_stop['field'].abs()**2 * wl_weights.view(-1, 1, 1)).sum()
-        return image, image.sum() / energy
+        energy = (post_stop['field'].abs()**2 * module['wavefront'].wl_weights.view(-1, 1, 1)).sum()
+        return image[pixels], image.sum() / energy
 
-    def image_on(theta, star, k):
-        with torch.no_grad():
-            return render(theta, star)[0][frames[k][2]]
-
-    stars = []
-    for k, (data, noise, _) in enumerate(frames):
-        if k == 0 and state.get('star') is not None:
-            stars.append(torch.as_tensor(state['star'], dtype=torch.float64, device=device))
-        else:
-            start = stars[0] if stars else torch.zeros(2, dtype=torch.float64, device=device)
-            stars.append(fit_star(lambda s: image_on(theta0, s, k), start, data, noise)[0])
+    image_of = lambda theta: (lambda star: render(theta, star)[0].detach())
+    zeros = torch.zeros(2, dtype=torch.float64, device=args.device)
+    star0 = (torch.as_tensor(state['star'], device=args.device) if state.get('star') is not None
+             else fit_star(image_of(theta0), zeros, data, noise)[0])
     with torch.no_grad():
-        start = [render(theta0, s) for s in stars]
-    images0 = [image[f[2]] for (image, _), f in zip(start, frames)]
-    shares0 = [float(share) for _, share in start]
-    fluxes = [least_squares_flux(image, f[0], f[1]) for image, f in zip(images0, frames)]
-    n_pixels = sum(len(f[2]) for f in frames)
-    budget = args.budget if args.budget is not None else (2 * n_pixels)**0.5
+        image0, share0 = render(theta0, star0)
+    flux0 = float((image0 * data / noise**2).sum() / (image0**2 / noise**2).sum())
+    budget = args.budget if args.budget is not None else (2 * len(pixels))**0.5
     delta = args.delta if args.delta is not None else budget / (4 * float((support * theta0).norm())**2)
 
     def residual_with(theta, nuisance):
-        """Whitened image change and window-share change of every frame; nuisance rows are star x, y and flux scale."""
-        rows = []
-        for k, (_, noise, pixels) in enumerate(frames):
-            image, share = render(theta, nuisance[k, :2])
-            rows.append(fluxes[k] * (nuisance[k, 2] * image[pixels] - images0[k]) / noise)
-            if args.share_weight:
-                rows.append(args.share_weight * (share / shares0[k] - 1)[None])
-        return torch.cat(rows)
+        """Whitened image change and weighted window-share change; nuisance = (star x, star y, flux scale)."""
+        image, share = render(theta, nuisance[:2])
+        return torch.cat([flux0 * (nuisance[2] * image - image0) / noise, args.share_weight * (share / share0 - 1)[None]])
 
-    nuisance0 = torch.cat([torch.stack(stars), torch.ones(len(frames), 1, dtype=torch.float64, device=device)], 1)
+    nuisance0 = torch.cat([star0, torch.ones(1, dtype=torch.float64, device=args.device)])
     residual = lambda theta: residual_with(theta, nuisance0)
 
     def nuisance_columns(theta):
-        _, jvp, _ = jacobian_products(lambda q: residual_with(theta, q.reshape(-1, 3)), nuisance0.reshape(-1))
-        return torch.stack([jvp(e) for e in torch.eye(nuisance0.numel(), dtype=torch.float64, device=device)], 1)
+        _, jvp, _ = jacobian_products(lambda q: residual_with(theta, q), nuisance0)
+        return torch.stack([jvp(e) for e in torch.eye(3, dtype=torch.float64, device=args.device)], 1)
 
     def chi2(theta):
-        values = []
-        for k, (data, noise, _) in enumerate(frames):
-            image = image_on(theta, stars[k], k)
-            values.append(float((((least_squares_flux(image, data, noise) * image - data) / noise)**2).mean()))
-        return values
-
-    def share_ratio(theta):
-        with torch.no_grad():
-            return [float(render(theta, s)[1]) / s0 for s, s0 in zip(stars, shares0)]
+        image = image_of(theta)(star0)
+        flux = (image * data / noise**2).sum() / (image**2 / noise**2).sum()
+        return float((((flux * image - data) / noise)**2).mean())
 
     rms = lambda theta: float((support * theta).norm())
+    share_of = lambda theta: float(render(theta, star0)[1].detach() / share0)
     chi2_0 = chi2(theta0)
-    say('frames: %s | pixels %d | budget %.1f | delta %.3g | share weight %g' % (
-        ', '.join(os.path.basename(f) for f in files), n_pixels, budget, delta, args.share_weight))
-    say('start: maps %.1f nm RMS | chi2/N %s' % (rms(theta0), numbers(chi2_0)))
-    accepted_steps = []
+    say('%s | %d pixels | budget %.1f | delta %.3g | share weight %g' % (os.path.basename(state['options']['data_file']), len(pixels),
+                                                                          budget, delta, args.share_weight))
+    say('start: maps %.1f nm RMS | chi2/N %.4f' % (rms(theta0), chi2_0))
+    n_accepted = [0]
 
     def report(accepted, theta, info):
-        if accepted:
-            accepted_steps.append(info)
-        say('%s a %.3f: maps %.1f nm RMS, invisible %.1f nm, image change %.1f (budget %.0f), window share %s, chi2/N %s (start %s), '
-            'CG %d it (residual %.1e), %.1f s' % ('step %d' % len(accepted_steps) if accepted else 'rejected', info['step_fraction'],
-                                                  info['norm'], info['invisible'], info['cost'], budget, numbers(share_ratio(theta)),
-                                                  numbers(chi2(theta)), numbers(chi2_0), info['cg'], info['cg_residual'], info['time']))
+        n_accepted[0] += accepted
+        say('%s a %.3f: maps %.1f nm RMS, invisible %.1f nm, image change %.1f (budget %.0f), window share %.4f, chi2/N %.4f, '
+            'CG %d it (residual %.1e), %.1f s' % ('step %d' % n_accepted[0] if accepted else 'rejected', info['step_fraction'],
+                                                  rms(theta), info['invisible'], info['cost'], budget, share_of(theta), chi2(theta),
+                                                  info['cg'], info['cg_residual'], info['time']))
 
     t0 = time.time()
     theta, history = null_space_walk(residual, nuisance_columns, theta0, support, args.steps, delta, budget, args.step_fraction,
                                      n_iter=args.n_iter, rank=args.rank, report=report)
-    walked = [fit_star(lambda s: image_on(theta, s, k), stars[k], fluxes[k] * images0[k], f[1]) for k, f in enumerate(frames)]
-    stars = [star for star, _ in walked]
-    say('walked: %d steps in %.0f s | maps %.1f -> %.1f nm RMS | chi2/N %s (start %s) | window share %s' % (
-        len(history), time.time() - t0, rms(theta0), rms(theta), numbers(chi2(theta)), numbers(chi2_0), numbers(share_ratio(theta))))
+    star, flux = fit_star(image_of(theta), star0, flux0 * image0, noise)
+    say('walked: %d steps in %.0f s | maps %.1f -> %.1f nm RMS | chi2/N %.4f -> %.4f | window share %.4f' % (
+        len(history), time.time() - t0, rms(theta0), rms(theta), chi2_0, chi2(theta), share_of(theta)))
 
     saved = {k: v for k, v in state.items() if k != 'options' and v is not None}
-    saved['pupil'] = (unit * theta[:n_map]).reshape(shape[-2:]).cpu().numpy()
-    saved['lyot'] = (unit * theta[n_map:]).reshape(shape[-2:]).cpu().numpy()
-    saved['star'], saved['flux'] = walked[0][0].cpu().numpy(), walked[0][1]
-    np.savez(out + '.npz', options=json.dumps(options), walk_history=json.dumps(history), walk_options=json.dumps(vars(args)), **saved)
+    saved.update(pupil=(unit * theta[:n_map]).reshape(1024, 1024).cpu().numpy(), lyot=(unit * theta[n_map:]).reshape(1024, 1024).cpu().numpy(),
+                 star=star.cpu().numpy(), flux=flux)
+    np.savez(out + '.npz', options=json.dumps(state['options']), **saved)
     say('saved %s.npz and %s.log' % (out, out))
 
 
