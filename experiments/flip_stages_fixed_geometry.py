@@ -53,7 +53,7 @@ injection_angles = [0., 90., 180., 270.]                     # [deg]
 DEVICE = os.environ.get('DEVICE', 'cuda')
 wf_npix = 1024
 diameter = 6.603464
-num_det_px = 80
+num_det_px = int(os.environ.get('NUM_DET_PX', 80))              # detector window [pixels]
 oversample = 2
 os.makedirs(out_dir, exist_ok=True)
 np.random.seed(0)

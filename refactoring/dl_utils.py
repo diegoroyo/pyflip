@@ -154,16 +154,23 @@ def load_and_crop_data(filepath, num_det_px=80, coron_type='MASK335R', crop_para
     Utility function to load JWST data as FITS files and format them for FLIP.
 
     Current automatic options are 'MASK335R' and 'MASKLWB_NARROW'.
+    A .npy filepath is PyFLIP's coadded format: <folder>/full_im/<name>.npy, with its noise
+    in <folder>/noise_maps/noisemap_<name>.npy.
     """
-    obs = fits.open(filepath)
-    obs_image = obs[1].data
-    obs_noise = obs[2].data
+    if filepath.endswith('.npy'):
+        coadded_image = np.squeeze(np.load(filepath))
+        noise_path = os.path.join(os.path.dirname(os.path.dirname(filepath)), 'noise_maps', 'noisemap_' + os.path.basename(filepath))
+        coadded_noise = np.squeeze(np.load(noise_path))
+    else:
+        obs = fits.open(filepath)
+        obs_image = obs[1].data
+        obs_noise = obs[2].data
 
-    coadded_image = np.mean(obs_image, axis=0)
-    coadded_image = np.squeeze(coadded_image) # I forget what the output shape is, so ensure a 2D array
+        coadded_image = np.mean(obs_image, axis=0)
+        coadded_image = np.squeeze(coadded_image) # I forget what the output shape is, so ensure a 2D array
 
-    coadded_noise = np.sqrt(np.sum(obs_noise**2, axis=0)) / len(obs_noise)
-    coadded_noise = np.squeeze(coadded_noise)
+        coadded_noise = np.sqrt(np.sum(obs_noise**2, axis=0)) / len(obs_noise)
+        coadded_noise = np.squeeze(coadded_noise)
 
     if coron_type == 'MASK335R':
         # Assume 320x320 SUBARRAY

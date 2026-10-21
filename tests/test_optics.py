@@ -628,6 +628,18 @@ def test_load_model_data_applies_substrate_once(tmp_path):
         np.testing.assert_allclose(load_model_data(str(tmp_path))[4], expected)
 
 
+def test_load_and_crop_data_reads_coadded_arrays(tmp_path):
+    """PyFLIP's coadded .npy frames are cropped like the FITS data, with their noise maps."""
+    from dl_utils import load_and_crop_data
+    (tmp_path / 'full_im').mkdir(); (tmp_path / 'noise_maps').mkdir()
+    image = np.arange(320 * 320, dtype=np.float32).reshape(1, 320, 320)
+    np.save(tmp_path / 'full_im' / 'frame.npy', image)
+    np.save(tmp_path / 'noise_maps' / 'noisemap_frame.npy', 2 * image)
+    data, noise = load_and_crop_data(str(tmp_path / 'full_im' / 'frame.npy'), num_det_px=80)
+    np.testing.assert_array_equal(data[0], image[0, 134:214, 110:190])
+    np.testing.assert_array_equal(noise[0], 2 * image[0, 134:214, 110:190])
+
+
 def test_shift_module_identity_and_integer_shift():
     mask = asymmetric_field(12).abs()[None]
     shift = ShiftModule(12, 12)
