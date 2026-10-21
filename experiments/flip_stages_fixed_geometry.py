@@ -9,7 +9,10 @@ CASE: a mask of fit_geometry_cases.py with its fitted geometry and the stop LYOT
 PyFLIP as shipped: its mask file (FFT occulter, with the mount), the model's stop, no
 FPM axial offset, its registration and blur. LOSS=chi2 replaces testing.py's smooth L1 /
 L1 losses and window flux rule by the noise-weighted chi^2 with the flux solved in closed
-form at every iteration.
+form at every iteration. TOTFRAC=f keeps the detector window's share of the light after the
+Lyot stop at least f times that of the zero-map model (penalty 35 x the zero-map loss x
+relu(f - share ratio)^2); DEADZONE=t [nm] adds DEADLAM x the mean over each map's support of
+relu(|map - mean| - t)^2 / t^2. Both are weighted like the stage's data term.
 
 Run from refactoring/ (inject_fake_planets reads data/ relative to the working
 directory). Paths and options below, or from the environment variables named there.
@@ -41,6 +44,9 @@ fpm_raster = os.environ.get('FPM_RASTER')                    # real mask raster 
 lyot_file = os.environ.get('LYOT_FILE')                      # stpsf's MASKRND transmission, 1024 x 1024
 out_dir = os.environ.get('OUT_DIR', 'flip_stages_' + case)
 loss_kind = os.environ.get('LOSS', 'flip')                   # flip (testing.py) | chi2
+total_fraction = float(os.environ.get('TOTFRAC', 0))         # 0: no light constraint
+dead_zone = float(os.environ.get('DEADZONE', 0)) * 1e-9       # [m]; 0: no map penalty
+dead_lam = float(os.environ.get('DEADLAM', 0.3))
 companion = [float(c) for c in os.environ.get('COMPANION', '-8.5,9.5').split(',')]   # in the first roll, from the array centre [px]
 fpm_focal_length = 131.4                                     # equivalent focal length [m]
 um_per_arcsec = {'593': 593.336, '637': 637.045}
@@ -121,23 +127,71 @@ def load_scored(path):
     return torch.from_numpy(np.where(good, data, 0.)).to(DEVICE), noise, torch.from_numpy(weights).to(DEVICE)
 
 
+#### PENALTIES
+supports = [diffnircam.optical_system.JWSTPrimary.amplitude.reshape(opds[0].shape) > 0,
+            diffnircam.optical_system.NIRCamLyotstop.transmission().detach().reshape(opds[1].shape) > 1e-3]
+post_stop = {}
+diffnircam.optical_system.NIRCamLyotstop.register_forward_hook(lambda module, inputs, output: post_stop.update(field=output))
+
+
+def window_share(PSF):
+    """Detector window light over the light after the Lyot stop (any common normalisation)."""
+    energy = (post_stop['field'].abs()**2 * wavefront_broad.wl_weights.view(-1, 1, 1)).sum()
+    return PSF.sum() / energy
+
+
+def dead_zone_penalty():
+    """DEADLAM x mean over each map's support of relu(|map - mean| - t)^2 / t^2, summed over the maps."""
+    total = 0.
+    for grid, support in zip(opds, supports):
+        m = grid[support] - grid[support].mean()
+        total = total + (torch.relu(m.abs() - dead_zone)**2).mean() / dead_zone**2
+    return dead_lam * total
+
+
+def zero_map_share():
+    """Window share of the current model with both maps at zero."""
+    saved = [g.detach().clone() for g in opds]
+    with torch.no_grad():
+        for g in opds:
+            g.zero_()
+        PSF = diffnircam(wavefront_broad)
+        share = window_share(PSF)
+        for g, v in zip(opds, saved):
+            g.copy_(v)
+    return share
+
+
 #### FIT (testing.py)
 sci_loss_weight = 0.005
 measure_SNR_every = 300
 snrs_arr, track_iters = [], []
+share_zero, loss_zero, share_history = {}, {}, []
 for i in tqdm.tqdm(range(scheduler_iters + 1), mininterval=30.0):
     optimizer.zero_grad()
     PSF = diffnircam(wavefront_broad)
+    stage_weight = 1. if i < stage_cutoffs[2] else sci_loss_weight
     if loss_kind == 'chi2':
         data, weights = (ref, ref_weights) if i < stage_cutoffs[2] else (sci, sci_weights)
         PSF = PSF * ((weights * PSF * data).sum() / (weights * PSF**2).sum()).detach()
-        loss = (weights * (PSF - data)**2).sum() / (weights > 0).sum() * (1. if i < stage_cutoffs[2] else sci_loss_weight)
+        loss = (weights * (PSF - data)**2).sum() / (weights > 0).sum() * stage_weight
     else:
         if i < stage_cutoffs[2]:
             loss = F.smooth_l1_loss(PSF, ref, reduction='none')
         else:
             loss = F.l1_loss(PSF, sci, reduction='none') * sci_loss_weight
         loss = (loss * px_mask).sum() / px_mask.sum()
+    if total_fraction:
+        frame = 'ref' if i < stage_cutoffs[2] else 'sci'
+        if frame not in share_zero:
+            share_zero[frame] = zero_map_share().detach()
+            loss_zero[frame] = loss.detach() / stage_weight
+        ratio = window_share(PSF) / share_zero[frame]
+        loss = loss + 35 * loss_zero[frame] * torch.relu(total_fraction - ratio)**2 * stage_weight
+        if i % 100 == 0:
+            share_history.append([i, ratio.item()])
+    if dead_zone:
+        loss = loss + dead_zone_penalty() * stage_weight
     loss.backward()
     if loss_kind != 'chi2' and i < stage_cutoffs[0]:
         wavefront_broad = hardcoded_match_flux(PSF, ref, px_mask, wavefront_broad)
@@ -233,7 +287,10 @@ for name, grid in grids.items():
     support = (diffnircam.optical_system.JWSTPrimary.amplitude if name == 'pupil' else diffnircam.optical_system.NIRCamLyotstop.amplitude).reshape(grid.shape) > 0
     scores['%s map [nm]' % name] = 1e9 * grid.detach()[support].std().item()
 
+if total_fraction:
+    scores['window share / zero maps, end'] = share_history[-1][1]
 np.savez(os.path.join(out_dir, 'scores.npz'), keys=np.array(list(scores)), values=np.array(list(scores.values())),
+         share_history=np.array(share_history),
          held_chi2=np.array(held_chi2), snr_track=np.array(snrs_arr), snr_iters=np.array(track_iters),
          pupil=opds[0].detach().cpu().numpy()[0], lyot=opds[1].detach().cpu().numpy()[0])
 print('case:', case)
