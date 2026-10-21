@@ -16,8 +16,12 @@ relu(|map - mean| - t)^2 / t^2. Both are weighted like the stage's data term.
 
 Run from refactoring/ (inject_fake_planets reads data/ relative to the working
 directory). Paths and options below, or from the environment variables named there.
-Saves the maps, residuals and scores to OUT_DIR and prints the scores.
+Saves the maps, residuals and scores to OUT_DIR and prints the scores. The fitted state at
+the end of the calibration and at the end of the fit (maps, flat field, star, flux,
+geometry and the options to rebuild the model) is saved as fitted_reference.npz and
+fitted_final.npz, the input of null_space_walk.py.
 """
+import json
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'refactoring'))
@@ -162,6 +166,32 @@ def zero_map_share():
     return share
 
 
+def save_state(path, data_file, data, weights):
+    """Save the fitted state for data_file: maps, flat field, star, least-squares flux, geometry and options."""
+    system = diffnircam.optical_system
+    occulter, lyot_optic, detector_ = system.NIRCamcoronfocalplanemask, system.NIRCamLyotstop, system.NIRCamdetector
+    with torch.no_grad():
+        flux_correction = wavefront_broad.flux_correction.data.detach().clone()
+        wavefront_broad.flux_correction.data.fill_(1.)
+        raw = diffnircam(wavefront_broad)
+        wavefront_broad.flux_correction.data.copy_(flux_correction)
+        flux = ((weights * raw * data).sum() / (weights * raw**2).sum()).item()
+    axial = getattr(occulter, 'axial_offset', None)
+    options = dict(model_dir=data_dir, data_file=data_file, px_mask=px_mask_path, num_det_px=num_det_px, oversample=oversample,
+                   case=case, fpm_raster=None if case == 'flip' else (os.path.join(geometry_dir, 'smooth_MASK335R_raster.npz')
+                                                                      if case.startswith('smooth') else fpm_raster),
+                   um_per_arcsec=None if case == 'flip' else um_per_arcsec[case.split('_')[0][-3:]],
+                   band_limited=case.startswith('smooth') or '_bl' in case, square_cells=case.endswith('_sq'),
+                   mount=case == 'flip', lyot_file=None if case == 'flip' else lyot_file, fpm_focal_length=fpm_focal_length)
+    np.savez(path, pupil=opds[0].detach().cpu().numpy()[0], lyot=opds[1].detach().cpu().numpy()[0],
+             flat=detector_.detector_flat_field.grid.detach().cpu().numpy()[0], star=wavefront_broad.angles_offset.detach().cpu().numpy(),
+             flux=flux, registration=np.array([float(detector_.subpixel_shift.shift_x), float(detector_.subpixel_shift.shift_y)]),
+             blur=float(torch.exp(detector_.charge_diffusion.log_sigma)) / oversample,
+             lyot_shift=np.array([lyot_optic.pupil_shifts.x_shift.item(), lyot_optic.pupil_shifts.y_shift.item()]),
+             clocking=lyot_optic.pupil_shifts.rotation.item(), fpm_dz=0. if axial is None else float(axial),
+             options=json.dumps(options))
+
+
 #### FIT (testing.py)
 sci_loss_weight = 0.005
 measure_SNR_every = 300
@@ -205,6 +235,7 @@ for i in tqdm.tqdm(range(scheduler_iters + 1), mininterval=30.0):
         calibrated = copy.deepcopy(diffnircam)                 # reference calibration, before the science stage
         calibrated_star = wavefront_broad.angles_offset.detach().clone()
         np.save(os.path.join(out_dir, 'residual_ref.npy'), (ref - PSF).detach().cpu().numpy())
+        save_state(os.path.join(out_dir, 'fitted_reference.npz'), refdatapath, ref, ref_weights)
     if i % measure_SNR_every == 0 and i > stage_cutoffs[2]:
         snrs_arr.append(track_SNR((sci - PSF).detach().cpu().numpy(), i, fakes, injected_fluxes, mask_name='MASK335R',
                                   snr_smooth_sigma=1., px_mask_numpy=px_mask_numpy, save_plot=False)[2])
@@ -212,6 +243,7 @@ for i in tqdm.tqdm(range(scheduler_iters + 1), mininterval=30.0):
     if i == stage_cutoffs[-1]:
         residual_sci = (sci - PSF).detach().cpu().numpy()
         np.save(os.path.join(out_dir, 'residual_sci.npy'), residual_sci)
+        save_state(os.path.join(out_dir, 'fitted_final.npz'), sci_files[0], sci, sci_weights)
         break
 
 
