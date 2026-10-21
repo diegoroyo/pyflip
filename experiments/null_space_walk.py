@@ -281,7 +281,7 @@ def null_space_walk(residual, nuisance_columns, theta, support, steps, delta, bu
         rebuilt at the current accepted parameters when a solve there misses the tolerance; 0
         uses none.
     report : callable, optional
-        Called after each trial with (accepted, info dict).
+        Called after each trial with (accepted, trial parameters, info dict).
 
     Returns
     -------
@@ -446,7 +446,45 @@ def load_frame(path, options, device):
     return (torch.as_tensor(data, device=device).reshape(-1)[pixels], torch.as_tensor(noise, device=device).reshape(-1)[pixels], pixels)
 
 
-def main():
+def least_squares_flux(image, target, noise):
+    """Flux that minimises sum(((flux * image - target) / noise)^2)."""
+    return float((image * target / noise**2).sum() / (image**2 / noise**2).sum())
+
+
+def fit_star(image_of, star, target, noise, steps=6, h=np.radians(5e-4 / 3600)):
+    """Star offset and flux that fit a model image to a target image, by Gauss-Newton.
+
+    Parameters
+    ----------
+    image_of : callable
+        Star offset [rad], shape (2,) -> model image on the used pixels.
+    star : torch.Tensor
+        Start offset [rad], shape (2,).
+    target, noise : torch.Tensor
+        Target image and its noise on the used pixels.
+    steps : int, optional
+        Gauss-Newton steps.
+    h : float, optional
+        Finite-difference step [rad].
+
+    Returns
+    -------
+    star : torch.Tensor
+        Fitted offset [rad].
+    flux : float
+        Least-squares flux at the fitted offset.
+    """
+    def r_of(s):
+        image = image_of(s)
+        return (least_squares_flux(image, target, noise) * image - target) / noise
+    for _ in range(steps):
+        r = r_of(star)
+        J = torch.stack([(r_of(star + h * e) - r) / h for e in torch.eye(2, dtype=star.dtype, device=star.device)], 1)
+        star = star + torch.linalg.lstsq(J, -r[:, None]).solution[:, 0]
+    return star, least_squares_flux(image_of(star), target, noise)
+
+
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('--state', help='state saved by flip_stages_fixed_geometry.py (fitted_*.npz)')
     parser.add_argument('--pupil_map', help='fitted JWSTPrimary OPD offsets (.npy, m)')
@@ -483,6 +521,11 @@ def main():
     args = parser.parse_args()
     if not args.state and not (args.pupil_map and args.lyot_map and args.model_dir and args.data):
         parser.error('give --state, or --pupil_map, --lyot_map, --model_dir and --data')
+    return args
+
+
+def main():
+    args = parse_args()
     device = args.device
     out = args.out or os.path.splitext(args.state or args.pupil_map)[0] + '_walked'
     log = open(out + '.log', 'w')
@@ -492,152 +535,109 @@ def main():
         log.write(line + '\n')
         log.flush()
 
+    numbers = lambda values: ' '.join('%.4f' % v for v in values)
+
     state = state_from_args(args)
     options = state['options']
     module = build_model(state, device)
-    lyot_optic = module['instrument'].optical_system.NIRCamLyotstop
+    system = module['instrument'].optical_system
     post_stop = {}
-    lyot_optic.register_forward_hook(lambda m, i, output: post_stop.update(field=output))
+    system.NIRCamLyotstop.register_forward_hook(lambda m, i, output: post_stop.update(field=output))
     wl_weights = module['wavefront'].wl_weights
     files = [options['data_file']] + [f for f in args.frames.split(',') if f]
     frames = [load_frame(f, options, device) for f in files]
 
-    shape = module['instrument'].optical_system.JWSTPrimary.wfe_offsets.grid.shape
+    shape = system.JWSTPrimary.wfe_offsets.grid.shape
     n_map = int(np.prod(shape))
-    supports = (module['instrument'].optical_system.JWSTPrimary.amplitude.reshape(-1) > 0,
-                lyot_optic.transmission().detach().reshape(-1) > 1e-3)
-    support = torch.cat(supports).double()
+    support = torch.cat([system.JWSTPrimary.amplitude.reshape(-1) > 0,
+                         system.NIRCamLyotstop.transmission().detach().reshape(-1) > 1e-3]).double()
     unit = 1e-9 * float(support.sum())**0.5                    # theta of norm 1 over the supports: maps of 1 nm RMS [m]
     theta0 = torch.as_tensor(np.concatenate([np.asarray(state['pupil']).reshape(-1), np.asarray(state['lyot']).reshape(-1)]),
                              dtype=torch.float64, device=device) / unit
 
     def render(theta, star):
-        """Model image on the used pixels of every frame's window, and the window share of the post-stop light."""
+        """Model image on the detector window, and the window share of the post-stop light."""
         params = {PUPIL: (unit * theta[:n_map]).reshape(shape), LYOT: (unit * theta[n_map:]).reshape(shape), STAR: star}
         image = torch.func.functional_call(module, params, ()).reshape(-1)
         energy = (post_stop['field'].abs()**2 * wl_weights.view(-1, 1, 1)).sum()
         return image, image.sum() / energy
 
-    def fit_star_flux(theta, star, k, steps=6, h=np.radians(5e-4 / 3600)):
-        """Star (Gauss-Newton) and least-squares flux of frame k against its data."""
-        data, noise, pixels = frames[k]
-        def r_of(s):
-            with torch.no_grad():
-                image = render(theta, s)[0][pixels]
-            flux = (image * data / noise**2).sum() / (image**2 / noise**2).sum()
-            return (flux * image - data) / noise, flux
-        for _ in range(steps):
-            r = r_of(star)[0]
-            J = torch.stack([(r_of(star + h * e)[0] - r) / h for e in torch.eye(2, dtype=torch.float64, device=device)], 1)
-            star = star + torch.linalg.lstsq(J, -r[:, None]).solution[:, 0]
-        r, flux = r_of(star)
-        return star, float(flux), float(r @ r) / len(r)
-
-    stars, fluxes = [], []
-    for k in range(len(frames)):
-        star = torch.as_tensor(state['star'], dtype=torch.float64, device=device) if (k == 0 and state.get('star') is not None) \
-            else (stars[0].clone() if stars else torch.zeros(2, dtype=torch.float64, device=device))
-        if k > 0 or state.get('star') is None:
-            star = fit_star_flux(theta0, star, k)[0]
-        stars.append(star)
-        data, noise, pixels = frames[k]
+    def image_on(theta, star, k):
         with torch.no_grad():
-            image = render(theta0, star)[0][pixels]
-        fluxes.append(float((image * data / noise**2).sum() / (image**2 / noise**2).sum()))
+            return render(theta, star)[0][frames[k][2]]
+
+    stars = []
+    for k, (data, noise, _) in enumerate(frames):
+        if k == 0 and state.get('star') is not None:
+            stars.append(torch.as_tensor(state['star'], dtype=torch.float64, device=device))
+        else:
+            start = stars[0] if stars else torch.zeros(2, dtype=torch.float64, device=device)
+            stars.append(fit_star(lambda s: image_on(theta0, s, k), start, data, noise)[0])
     with torch.no_grad():
         start = [render(theta0, s) for s in stars]
-    images0 = [im[f[2]] for (im, _), f in zip(start, frames)]
-    shares0 = [float(sh) for _, sh in start]
+    images0 = [image[f[2]] for (image, _), f in zip(start, frames)]
+    shares0 = [float(share) for _, share in start]
+    fluxes = [least_squares_flux(image, f[0], f[1]) for image, f in zip(images0, frames)]
     n_pixels = sum(len(f[2]) for f in frames)
     budget = args.budget if args.budget is not None else (2 * n_pixels)**0.5
+    delta = args.delta if args.delta is not None else budget / (4 * float((support * theta0).norm())**2)
 
-    def residual_with(theta, star_list):
+    def residual_with(theta, nuisance):
+        """Whitened image change and window-share change of every frame; nuisance rows are star x, y and flux scale."""
         rows = []
-        for k, ((data, noise, pixels), star) in enumerate(zip(frames, star_list)):
-            image, share = render(theta, star)
-            rows.append((fluxes[k] * image[pixels] - fluxes[k] * images0[k]) / noise)
+        for k, (_, noise, pixels) in enumerate(frames):
+            image, share = render(theta, nuisance[k, :2])
+            rows.append(fluxes[k] * (nuisance[k, 2] * image[pixels] - images0[k]) / noise)
             if args.share_weight:
                 rows.append(args.share_weight * (share / shares0[k] - 1)[None])
         return torch.cat(rows)
 
-    residual = lambda theta: residual_with(theta, stars)
+    nuisance0 = torch.cat([torch.stack(stars), torch.ones(len(frames), 1, dtype=torch.float64, device=device)], 1)
+    residual = lambda theta: residual_with(theta, nuisance0)
 
     def nuisance_columns(theta):
-        columns = []
-        for k in range(len(frames)):
-            _, jvp, _ = jacobian_products(lambda s: residual_with(theta, stars[:k] + [s] + stars[k + 1:]), stars[k])
-            columns += [jvp(e) for e in torch.eye(2, dtype=torch.float64, device=device)]
-            flux_column, offset = torch.zeros_like(columns[-1]), 0
-            for j, (data, noise, pixels) in enumerate(frames):
-                n = len(pixels)
-                if j == k:
-                    with torch.no_grad():
-                        flux_column[offset:offset + n] = fluxes[k] * render(theta, stars[k])[0][pixels] / noise
-                offset += n + (1 if args.share_weight else 0)
-            columns.append(flux_column)
-        return torch.stack(columns, 1)
+        _, jvp, _ = jacobian_products(lambda q: residual_with(theta, q.reshape(-1, 3)), nuisance0.reshape(-1))
+        return torch.stack([jvp(e) for e in torch.eye(nuisance0.numel(), dtype=torch.float64, device=device)], 1)
 
     def chi2(theta):
         values = []
-        for k, (data, noise, pixels) in enumerate(frames):
-            with torch.no_grad():
-                image = render(theta, stars[k])[0][pixels]
-            flux = (image * data / noise**2).sum() / (image**2 / noise**2).sum()
-            values.append(float((((flux * image - data) / noise)**2).mean()))
+        for k, (data, noise, _) in enumerate(frames):
+            image = image_on(theta, stars[k], k)
+            values.append(float((((least_squares_flux(image, data, noise) * image - data) / noise)**2).mean()))
         return values
 
     def share_ratio(theta):
         with torch.no_grad():
             return [float(render(theta, s)[1]) / s0 for s, s0 in zip(stars, shares0)]
 
-    def rms(theta):
-        return float((support * theta).norm())
-
+    rms = lambda theta: float((support * theta).norm())
     chi2_0 = chi2(theta0)
-    delta = args.delta if args.delta is not None else budget / (4 * float((support * theta0).norm())**2)
-    say('frames: %s | pixels %d | budget %.1f | delta %.3g | share weight %g' % (', '.join(os.path.basename(f) for f in files), n_pixels,
-                                                                              budget, delta, args.share_weight))
-    say('start: maps %.1f nm RMS | chi2/N %s' % (rms(theta0), ' '.join('%.4f' % c for c in chi2_0)))
+    say('frames: %s | pixels %d | budget %.1f | delta %.3g | share weight %g' % (
+        ', '.join(os.path.basename(f) for f in files), n_pixels, budget, delta, args.share_weight))
+    say('start: maps %.1f nm RMS | chi2/N %s' % (rms(theta0), numbers(chi2_0)))
+    accepted_steps = []
 
     def report(accepted, theta, info):
-        say('%s a %.3f: maps %.1f nm RMS, invisible %.1f nm, image change %.1f (budget %.0f), window share %s, chi2/N %s (start %s), '
-            'CG %d it (residual %.1e), %.1f s' % ('step %d' % (len(history_box) + 1) if accepted else 'rejected', info['step_fraction'],
-                                                  info['norm'], info['invisible'], info['cost'], budget,
-                                                  ' '.join('%.4f' % v for v in share_ratio(theta)), ' '.join('%.4f' % c for c in chi2(theta)),
-                                                  ' '.join('%.4f' % c for c in chi2_0), info['cg'], info['cg_residual'], info['time']))
         if accepted:
-            history_box.append(info)
+            accepted_steps.append(info)
+        say('%s a %.3f: maps %.1f nm RMS, invisible %.1f nm, image change %.1f (budget %.0f), window share %s, chi2/N %s (start %s), '
+            'CG %d it (residual %.1e), %.1f s' % ('step %d' % len(accepted_steps) if accepted else 'rejected', info['step_fraction'],
+                                                  info['norm'], info['invisible'], info['cost'], budget, numbers(share_ratio(theta)),
+                                                  numbers(chi2(theta)), numbers(chi2_0), info['cg'], info['cg_residual'], info['time']))
 
-    history_box = []
     t0 = time.time()
     theta, history = null_space_walk(residual, nuisance_columns, theta0, support, args.steps, delta, budget, args.step_fraction,
                                      n_iter=args.n_iter, rank=args.rank, report=report)
-    walked_stars, walked_fluxes = [], []
-    for k in range(len(frames)):
-        data, noise, pixels = frames[k]
-        star, h = stars[k], np.radians(5e-4 / 3600)
-        def r_of(s):
-            with torch.no_grad():
-                image = render(theta, s)[0][pixels]
-            flux = (image * images0[k]).sum() / (image**2).sum()
-            return (flux * image - images0[k]) / noise, flux
-        for _ in range(6):
-            r = r_of(star)[0]
-            J = torch.stack([(r_of(star + h * e)[0] - r) / h for e in torch.eye(2, dtype=torch.float64, device=device)], 1)
-            star = star + torch.linalg.lstsq(J, -r[:, None]).solution[:, 0]
-        walked_stars.append(star)
-        walked_fluxes.append(fluxes[k] * float(r_of(star)[1]))
-    stars = walked_stars
+    walked = [fit_star(lambda s: image_on(theta, s, k), stars[k], fluxes[k] * images0[k], f[1]) for k, f in enumerate(frames)]
+    stars = [star for star, _ in walked]
     say('walked: %d steps in %.0f s | maps %.1f -> %.1f nm RMS | chi2/N %s (start %s) | window share %s' % (
-        len(history), time.time() - t0, rms(theta0), rms(theta), ' '.join('%.4f' % c for c in chi2(theta)),
-        ' '.join('%.4f' % c for c in chi2_0), ' '.join('%.4f' % v for v in share_ratio(theta))))
+        len(history), time.time() - t0, rms(theta0), rms(theta), numbers(chi2(theta)), numbers(chi2_0), numbers(share_ratio(theta))))
 
-    walked = {k: v for k, v in state.items() if k != 'options' and v is not None}
-    walked['pupil'] = (unit * theta[:n_map]).reshape(shape[-2:]).cpu().numpy()
-    walked['lyot'] = (unit * theta[n_map:]).reshape(shape[-2:]).cpu().numpy()
-    walked['star'], walked['flux'] = walked_stars[0].cpu().numpy(), walked_fluxes[0]
-    np.savez(out + '.npz', options=json.dumps(options), walk_history=json.dumps(history),
-             walk_options=json.dumps(vars(args)), **walked)
+    saved = {k: v for k, v in state.items() if k != 'options' and v is not None}
+    saved['pupil'] = (unit * theta[:n_map]).reshape(shape[-2:]).cpu().numpy()
+    saved['lyot'] = (unit * theta[n_map:]).reshape(shape[-2:]).cpu().numpy()
+    saved['star'], saved['flux'] = walked[0][0].cpu().numpy(), walked[0][1]
+    np.savez(out + '.npz', options=json.dumps(options), walk_history=json.dumps(history), walk_options=json.dumps(vars(args)), **saved)
     say('saved %s.npz and %s.log' % (out, out))
 
 
