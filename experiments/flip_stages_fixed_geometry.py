@@ -170,6 +170,7 @@ share_zero, loss_zero, share_history = {}, {}, []
 for i in tqdm.tqdm(range(scheduler_iters + 1), mininterval=30.0):
     optimizer.zero_grad()
     PSF = diffnircam(wavefront_broad)
+    share = window_share(PSF) if total_fraction else None    # before any flux scaling
     stage_weight = 1. if i < stage_cutoffs[2] else sci_loss_weight
     if loss_kind == 'chi2':
         data, weights = (ref, ref_weights) if i < stage_cutoffs[2] else (sci, sci_weights)
@@ -186,7 +187,7 @@ for i in tqdm.tqdm(range(scheduler_iters + 1), mininterval=30.0):
         if frame not in share_zero:
             share_zero[frame] = zero_map_share().detach()
             loss_zero[frame] = loss.detach() / stage_weight
-        ratio = window_share(PSF) / share_zero[frame]
+        ratio = share / share_zero[frame]
         loss = loss + 35 * loss_zero[frame] * torch.relu(total_fraction - ratio)**2 * stage_weight
         if i % 100 == 0:
             share_history.append([i, ratio.item()])
