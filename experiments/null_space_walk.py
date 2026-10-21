@@ -53,7 +53,9 @@ the other fields as given) and <out>.log, one line per trial step:
   - chi2/N: noise-weighted chi^2 per pixel of the model against the data, flux fitted.
 
 The walk stops after --steps accepted steps, or when even a step of 1/64 of
---step_fraction leaves the budget.
+--step_fraction leaves the budget. If the log's CG residual grows well above 1e-3, the
+invisible part is no longer computed accurately and the maps stop shrinking: raise --rank
+or --n_iter.
 """
 import argparse
 import json
@@ -63,6 +65,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'refactoring'))
 
 
 #### WALK (model-independent)
@@ -397,7 +400,6 @@ def state_from_args(args):
 
 def build_model(state, device):
     """PyFLIP instrument and wavefront for a fitted state (maps and star are set by the walk)."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'refactoring'))
     from wavefronts import BroadbandWavefront
     from model_building import assemble_JWST_NIRCam_coron
     from dl_utils import load_model_data
@@ -436,7 +438,6 @@ def build_model(state, device):
 
 def load_frame(path, options, device):
     """Data, noise and the used pixels of one frame, flattened to those pixels."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'refactoring'))
     from dl_utils import load_and_crop_data
     data, noise = (np.squeeze(a).astype(np.float64) for a in load_and_crop_data(path, num_det_px=options['num_det_px'], coron_type='MASK335R'))
     good = np.isfinite(data) & np.isfinite(noise) & (noise > 0)
@@ -513,7 +514,8 @@ def parse_args():
     parser.add_argument('--budget', type=float, help='largest image change, sum of ((image - start) / noise)^2; default sqrt(2 N)')
     parser.add_argument('--delta', type=float, help='image change per (nm RMS)^2 below which a map direction is invisible; '
                         'default budget / (4 x the squared start map RMS), so removing all of it stays within the budget')
-    parser.add_argument('--share_weight', type=float, default=300., help='weight of the window-share rows; 0 does not keep the share')
+    parser.add_argument('--share_weight', type=float, default=300., help='weight of the window-share rows: the relative share may '
+                        'change by up to sqrt(budget) / share_weight; 0 does not keep the share')
     parser.add_argument('--rank', type=int, default=800, help='rank of the Nystrom preconditioner; 0: none')
     parser.add_argument('--n_iter', type=int, default=300, help='conjugate-gradient iterations per solve')
     parser.add_argument('--out', help='output name without extension; default: <state or pupil map>_walked')
