@@ -621,6 +621,35 @@ def test_shift_module_identity_and_integer_shift():
     torch.testing.assert_close(shift(mask), expected, rtol=0, atol=1e-15)
 
 
+def test_shift_module_shift_and_back():
+    """Shifting a mask and shifting it back returns it: exactly for whole samples and a quarter
+    turn, and for a fraction f of a sample up to bilinear interpolation's smoothing
+    [f(1 - f), 1 - 2 f(1 - f), f(1 - f)] along each axis, which is itself exact (away from
+    the edges the shifts move off the grid)."""
+    n = 24
+    mask = asymmetric_field(n).abs()[None]
+
+    def moved(m, x, y, rotation):
+        shift = ShiftModule(n, n)
+        with torch.no_grad():
+            shift.x_shift.fill_(x)
+            shift.y_shift.fill_(y)
+            shift.rotation.fill_(rotation)
+            return shift(m)
+
+    inner = (..., slice(4, -4), slice(4, -4))
+    for x, y, rotation in ((3., -2., 0.), (0., 0., 90.)):
+        returned = moved(moved(mask, x, y, rotation), -x, -y, -rotation)
+        torch.testing.assert_close(returned[inner], mask[inner], rtol=0, atol=1e-14)
+    x, y = 2.4, -0.7
+    expected = mask
+    for fraction, dim in ((x % 1, -1), (y % 1, -2)):
+        w = fraction * (1 - fraction)
+        expected = (1 - 2 * w) * expected + w * (torch.roll(expected, 1, dim) + torch.roll(expected, -1, dim))
+    returned = moved(moved(mask, x, y, 0.), -x, -y, 0.)
+    torch.testing.assert_close(returned[inner], expected[inner], rtol=0, atol=1e-14)
+
+
 def test_shift_module_rotation_direction_and_gradient():
     """+90 deg turns +x into +y; shift and rotation gradients match finite differences."""
     mask = torch.zeros(1, 9, 9, dtype=torch.float64)
