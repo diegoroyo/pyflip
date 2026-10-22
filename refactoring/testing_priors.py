@@ -1,7 +1,21 @@
-# testing.py with learned (diffusion) priors on the OPDs and a fitted star flux. Defaults: the best-performing configuration
-# (OTE: drift prior on the WFS map over the whole reference calibration; Lyot plane: drift prior on the static NIRCam OPD
-# on both frames; flux refitted by gradient). USE_PRIOR = False, lyot_mode = 'free' and fit_flux = False give testing.py.
-# Paths are relative to this directory; the prior files go in HIP65426/priors (see its README).
+# testing.py with diffusion priors on the OTE / Lyot OPDs and a star flux fitted by gradient.
+# The default values represent the best run so far (SNR ~52 for HPI 65426)
+# To get the default behaviour, set USE_PRIOR = False, lyot_mode = 'free', fit_flux = False
+# Configuration:
+# * USE_PRIOR injects the prior behaviour onto the pyFLIP code
+# * ote_prior_mode ('offset' | 'replace') for whether the prior represents a full WFS map or the drift between consecutive WFS maps
+# Inference/diffusion schedule config
+# * ref_ote_prior_start/end (DPS window on the reference frame), sci_ote_prior_start/end (window on the science frame),
+# * ote_grid_frozen_until, ote_guidance_scale,
+# * ote_prior_sigma_max/min, ote_prior_sde, ote_prior_seed,
+# Similar parameters for the lyot:
+# * lyot_mode ('free' | 'drift'), lyot_prior_start/end,
+# * lyot_sci_prior_start/end, lyot_guidance_scale, lyot_sci_guidance_scale
+# Extra module to fit the flux scaling:
+# * fit_flux, flux_lr.
+#
+# The diff between this file and tesing.py is small
+
 from wavefronts import BroadbandWavefront
 from model_building import assemble_JWST_NIRCam_coron
 from optimization_handlers import default_stages
