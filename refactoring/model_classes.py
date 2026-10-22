@@ -39,10 +39,11 @@ class ShiftModule(nn.Module):
     def forward(self, mask):
         """Moved mask, with the shape (..., height, width) and dtype of mask."""
         height, width = mask.shape[-2:]
-        cos, sin = torch.cos(torch.deg2rad(self.rotation)), torch.sin(torch.deg2rad(self.rotation))
-        x, y = self.x - self.x_shift, self.y - self.y_shift
-        x_in = (cos * x + sin * y) / self.scale
-        y_in = (-sin * x + cos * y) / self.scale
+        angle = torch.deg2rad(self.rotation)
+        cos, sin = torch.cos(angle), torch.sin(angle)
+        rot_matrix = torch.stack((torch.cat((cos, sin)), torch.cat((-sin, cos))))
+        positions = torch.stack((self.x - self.x_shift, self.y - self.y_shift), dim=-1)
+        x_in, y_in = (positions @ rot_matrix.T / self.scale).unbind(-1)
         grid = torch.stack((x_in * 2 / width, y_in * 2 / height), dim=-1)
         flat = mask.reshape(-1, 1, height, width).to(torch.float64)
         out = F.grid_sample(flat, grid.expand(len(flat), -1, -1, -1), mode='bilinear', padding_mode='zeros', align_corners=False)
