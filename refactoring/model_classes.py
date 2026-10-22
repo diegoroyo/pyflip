@@ -65,7 +65,7 @@ class DetSubPixShift(nn.Module):
         theta = torch.tensor([[
             [1, 0, -2 * self.shift_x / W],  # x shift
             [0, 1, -2 * self.shift_y / H]   # y shift
-        ]], dtype=torch.double, device=image.device)
+        ]], dtype=image.dtype, device=image.device)
 
         # Repeat theta for batch
         theta = theta.expand(N, -1, -1)
@@ -97,7 +97,7 @@ def shift_image_subpixel(image: torch.Tensor, shift_x: float = -0.12, shift_y: f
     theta = torch.tensor([[
         [1, 0, -2 * shift_x / W],  # x shift
         [0, 1, -2 * shift_y / H]   # y shift
-    ]], dtype=torch.double, device=image.device)
+    ]], dtype=image.dtype, device=image.device)
 
     # Repeat theta for batch
     theta = theta.expand(N, -1, -1)
@@ -404,7 +404,7 @@ class LearnableGaussianBlur(nn.Module):
             raise ValueError("Input must have shape (1, 1, N, H, W)")
 
         sigma = torch.exp(self.log_sigma)
-        coords = torch.arange(self.kernel_size, dtype=torch.double, device=x.device) - self.kernel_size // 2
+        coords = torch.arange(self.kernel_size, dtype=x.dtype, device=x.device) - self.kernel_size // 2
         kernel_1d = torch.exp(-0.5 * (coords / sigma)**2)
         kernel_1d = kernel_1d / kernel_1d.sum()
 
