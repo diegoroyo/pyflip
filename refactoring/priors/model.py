@@ -3,17 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-# Diffusion prior on the OTE OPD, trained in InverseBench (EDM framework, Karras et al. 2022) on 256x256 spline nodes
-# of JWST WSS OPD maps. The network below is a trimmed copy of InverseBench's models/precond.py (EDMPrecond) and
-# models/unets.py (DhariwalUNet) keeping only what the checkpoint uses, with the same module/parameter names so that
-# the checkpoint loads unchanged. Training-only options (class labels, augmentation, dropout, fp16) are removed.
+# Port of part of InverseBench (EDM framework, Karras et al. 2022) to a standalone module for use in pyFLIP.
 #
-# Network units -> OPD in metres (as InverseBench's unnormalize):
-#   opd_file = pupil_1024 * (A @ (x * scale + mean) @ A.T),  x: (1, 1, 256, 256), opd_file: (1024, 1024)
-# with, for a prior on full OPD maps (kind 'map'): scale = 2 std and mean = mean_map of the training set (stats.npz), and
-# for a prior on the drift between consecutive WSS maps (kind 'drift'): scale from the export's normalization.npz, mean 0.
-# This is in the orientation of the OPD files; pyFLIP flips those in y (dl_utils.load_model_data), and so does
-# OPDPrior.to_opd. The spline matrix A and pupil_1024 come from the training set's stats.npz in both cases.
+# The network is designed to work on 256x256 spline nodes of JWST WSS OPD maps, and the prior is trained on those.
+# "spline nodes" are the control points of a cubic spline interpolation of the OPD map, which is the way that
+# stpsf up/downscales these maps to the 1024x1024 pupil plane.
+#
+# There are two kinds of priors: one on the full OPD map (kind 'map'), and one on the drift between consecutive WSS maps (kind 'drift').
+# Experimentally the first one can perform worse if the telescope reaches a state not represented in the training set,
+# but the evolution (drift) is much more consistent to that of the training set, so this performs better but needs some initialization.
 
 ############ NETWORK
 

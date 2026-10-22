@@ -1,0 +1,12 @@
+# local experiment scaffolding and data (see HIP65426/priors/README.md)
+outputs/
+__pycache__/
+refactoring/testing_priors_plot.py
+HIP65426/drive_data/
+HIP65426/priors/calints/
+HIP65426/priors/outputs/
+HIP65426/priors/*.pt
+HIP65426/priors/*.npz
+HIP65426/priors/ote_field_term_*.npy
+refactoring/priors/plots.py
+refactoring/vis_iters/

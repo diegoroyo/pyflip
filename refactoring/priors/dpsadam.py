@@ -3,31 +3,18 @@ import torch.nn as nn
 import numpy as np
 from priors.schedule import EDMSchedule
 
-# DPS-Adam (InverseBench algo/dps_adam.py: diffusion posterior sampling where the likelihood step is an Adam step)
-# driven by pyFLIP's own optimization loop. DPSAdamOPD replaces model_classes.OPDOffsetModule as the 'wfe_offsets' of
-# a DiffPupilOptic: like it, it has a free 'grid' parameter and forward(opd) returns the OPD layer, so the optimizer
-# groups and the stage handlers of testing.py work unchanged.
+# DPS-Adam: custom diffusion posterior sampling (using Adam optimizer instead of SGD)
+# Replaces model_classes.OPDOffsetModule as the 'wfe_offsets' of a DiffPupilOptic.
+# Each diffusion generation has two modes:
+# 1) 'offset': the prior models only the drift on top of the WFS map. Returns WFS map + prior
+# 2) 'replace': the prior models the full OPD, the WFS map is ignored. Returns prior only.
+# A free grid parameter can added on top of all this (if diffusion ends before the whole FLIP process ends)
 #
-# The OTE OPD layer is a sum of pieces, by pyFLIP iteration i:
-#   - the optic's own OPD (pyFLIP's WFS map) in mode 'offset', or in mode 'replace' only before the first phase starts
-#     (init='wfs'; init='mean' gives the first prior's mean map instead). In mode 'replace' the field term (stpsf's
-#     field-dependent OTE WFE, which the WFS map contains and the prior's training maps do not) is added from then on.
-#   - one DPSPhase per DPS-Adam sampling window [start, end): during the window, one diffusion step per iteration (the
-#     OPD is to_opd(D(latent, sigma)) with the graph attached, pyFLIP's loss.backward() puts the likelihood gradient in
-#     latent.grad, pyFLIP's optimizer applies it (the latents are one of its parameter groups) and the prior move of
-#     the latent (reverse diffusion step, score from the same denoised map) is applied at the top of the next
-#     iteration; the two moves are additive, so this is the same as applying the prior move first, as dps_adam.py).
-#     After the window the phase's output is frozen (the latent, or D(latent, sigma_final) if final_denoise).
-#     Typical use: one phase on the reference frame with a full-map prior (mode 'replace') or a drift prior
-#     (mode 'offset'), optionally a second phase on the science frame with a drift prior (a drift on top of what
-#     the reference stage gave). Phases must not overlap.
-#   - 'grid', pyFLIP's free OPD, optimized by pyFLIP's own code like OPDOffsetModule.grid; its gradient is zeroed
-#     (hook) before grid_frozen_until (default: the end of the first phase) and inside every phase window, so it only
-#     moves in between (reference stage) and after the last phase (science stage, see priors/stages.py). Note that
-#     default_stages zeroes no gradient at an iteration equal to a stage cutoff, so a grid whose Adam state is still
-#     empty would take a large step there; keep it frozen past such iterations.
-#
-# Use in the loop (see testing_priors.py): ote_prior.step(i) right after optimizer.zero_grad(), nothing else.
+# There can be multiple DPS-Adam phases (e.g. one for the reference frame, one for the science frame),
+# each with its own prior and sampling window. They are configured using the DPSPhase class, which takes
+# - prior: a OPDPrior object (see priors/model.py)
+# - start, end: the iteration window [start, end) of this phase (end - start diffusion steps)
+# - sigma, sde, final_denoise, etc. config for noise schedule and such
 
 class DPSPhase:
     """

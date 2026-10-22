@@ -1,9 +1,8 @@
 import numpy as np
 import torch
 
-# optimization_handlers.default_stages with one switch: fit_ote_in_science keeps the OTE OPD (the residual grid of
-# priors.dpsadam.DPSAdamOPD) fitted in stage 2.2 (science target, after the position fit), for refining it after a DPS
-# phase on the science frame. With the switch off this is default_stages.
+# optimization_handlers.default_stages with one special quirk: an additional flag fit_ote_in_science
+# if False, this is the default_stages behaviour; if True, the OTE OPD is also optimized in science stage
 
 def prior_stages(instrument, wavefront, stage_number, stage_cutoffs = [600, 3500, 5500, 6100, 11000], fit_ote_in_science=False):
     # Zero-out gradients of parameters we are not optimizing per stage
